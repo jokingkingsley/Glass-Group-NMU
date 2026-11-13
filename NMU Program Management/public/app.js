@@ -75,7 +75,7 @@ async function refresh() {
 function renderLogin(message = "") {
   document.body.classList.add("auth-screen");
   modalRoot.innerHTML = "";
-  content.innerHTML = `<section class="login-card" aria-labelledby="login-title"><div class="brand-symbol">n</div><div class="eyebrow">NMU PROGRAM OPERATIONS</div><h1 id="login-title">Sign in to your workspace</h1><p class="heading-copy">Use the NMU account created for you by an administrator.</p>
+  content.innerHTML = `<section class="login-card" aria-labelledby="login-title"><img class="login-logo" src="/nmu-logo.png" alt="No More Under" width="180" height="78"><div class="eyebrow">NMU PROGRAM OPERATIONS</div><h1 id="login-title">Sign in to your workspace</h1><p class="heading-copy">Use the NMU account created for you by an administrator.</p>
     ${!state.administratorConfigured?`<div class="inline-error">No administrator account is configured yet. Set <span class="code">NMU_ADMIN_EMAIL</span> and <span class="code">NMU_ADMIN_PASSWORD</span> in Railway Variables, then redeploy.</div>`:""}
     ${message?`<div class="inline-error">${escapeHtml(message)}</div>`:""}
     <form id="login-form"><div class="form-field"><label for="login-email">Email address</label><input id="login-email" name="email" type="email" autocomplete="username" required></div><div class="form-field"><label for="login-password">Password</label><input id="login-password" name="password" type="password" autocomplete="current-password" required></div><button class="button primary" type="submit" ${state.administratorConfigured?"":"disabled"}>Sign in</button></form>
@@ -257,7 +257,8 @@ function renderTimeline() {
 }
 // ---- Calendar ---------------------------------------------------------------
 const CALENDAR_COLORS = [
-  { soft: "#e5f2ee", text: "#1f5a52", solid: "#2f786d" },
+  { soft: "#e8e9f6", text: "#2c3185", solid: "#2c3185" },
+  { soft: "#e3f5fc", text: "#0b5874", solid: "#1586b4" },
   { soft: "#fbf0e2", text: "#7a4a0e", solid: "#b06a1c" },
   { soft: "#e9f0f7", text: "#2c4f70", solid: "#3f6d96" },
   { soft: "#f1ecf7", text: "#55407a", solid: "#7a5a9e" },
