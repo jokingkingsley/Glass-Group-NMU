@@ -3,6 +3,7 @@ const state = {
   data: null, projectId: null, projectTab: "overview", projectSearch: "", projectStatus: "all",
   projectFilters: { city: "all", state: "all", programType: "all", host: "all", manager: "all", dateFrom: "", dateTo: "", sort: "date-asc" },
   taskStatusFilter: "all", taskSearch: "", myTaskFilter: "All tasks", taskSort: "due-asc", authRequired: false,
+  calendar: { view: "month", cursor: new Date().toISOString().slice(0, 10), programId: "all" },
   administratorConfigured: false, accountUsers: [], airtableSync: null,
   airtableData: { tables: [], selectedTableId: null, records: [], recordLabels: {}, total: 0, offset: 0, limit: 25, query: "", loading: false }
 };
@@ -254,6 +255,108 @@ function renderTimeline() {
   return `${pageHeading("SCHEDULE", "Program timeline", "A chronological view of upcoming work, grouped by month. Blocked and overdue tasks stay visible so teams can act early.")}
     <div class="dashboard-grid"><section class="panel"><div class="panel-head"><div><h2 class="panel-title">Upcoming deadlines</h2><p class="panel-subtitle">${tasks.length} open tasks · all accessible programs</p></div></div>${tasks.length ? [...groups.entries()].map(([month,items])=>`<div class="panel-head"><h3 class="panel-title">${escapeHtml(month)}</h3></div><div class="timeline-list">${items.map((task)=>`<div class="timeline-item ${isOverdue(task)?"overdue":""}"><time class="timeline-date">${dateLabel(task.dueDate,{month:"short",day:"numeric"})}</time><span class="timeline-marker"></span><div class="timeline-copy"><strong><button class="task-link" data-task="${escapeHtml(task.id)}">${escapeHtml(task.title)}</button></strong><small>${escapeHtml(task.projectName)} · ${escapeHtml(task.assigneeName || "Unassigned")} · ${escapeHtml(task.milestone)} · ${task.isBlocked?"Blocked by prerequisite":task.status}</small></div></div>`).join("")}</div>`).join("") : `<div class="empty-state"><strong>No open deadlines</strong>All tasks are complete.</div>`}</section><section class="panel"><div class="panel-head"><div><h2 class="panel-title">Date changes</h2><p class="panel-subtitle">Preview and apply from a program workspace</p></div></div><div class="empty-state"><span class="empty-mark">◷</span><strong>Replan with a preview</strong>Open a program workspace and choose “Adjust dates” to preview how an updated program start date will shift outstanding tasks.</div></section></div>`;
 }
+// ---- Calendar ---------------------------------------------------------------
+const CALENDAR_COLORS = [
+  { soft: "#e5f2ee", text: "#1f5a52", solid: "#2f786d" },
+  { soft: "#fbf0e2", text: "#7a4a0e", solid: "#b06a1c" },
+  { soft: "#e9f0f7", text: "#2c4f70", solid: "#3f6d96" },
+  { soft: "#f1ecf7", text: "#55407a", solid: "#7a5a9e" },
+  { soft: "#fbeeee", text: "#8a3a33", solid: "#b0534a" },
+  { soft: "#eef3e3", text: "#4a5a1c", solid: "#6c8230" }
+];
+const isoDay = (date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+const parseDay = (value) => { const [y, m, d] = value.slice(0, 10).split("-").map(Number); return new Date(y, m - 1, d); };
+const shiftDay = (value, days) => { const date = parseDay(value); date.setDate(date.getDate() + days); return isoDay(date); };
+function calendarRange() {
+  const { view, cursor } = state.calendar;
+  const anchor = parseDay(cursor);
+  if (view === "week") {
+    const start = new Date(anchor); start.setDate(anchor.getDate() - anchor.getDay());
+    return { start: isoDay(start), days: 7 };
+  }
+  const first = new Date(anchor.getFullYear(), anchor.getMonth(), 1);
+  const start = new Date(first); start.setDate(1 - first.getDay());
+  const last = new Date(anchor.getFullYear(), anchor.getMonth() + 1, 0);
+  const days = Math.ceil((first.getDay() + last.getDate()) / 7) * 7;
+  return { start: isoDay(start), days };
+}
+function calendarEvents() {
+  const programs = state.data.projects.filter((project) => state.calendar.programId === "all" || project.id === state.calendar.programId);
+  const colorFor = new Map(state.data.projects.map((project, index) => [project.id, CALENDAR_COLORS[index % CALENDAR_COLORS.length]]));
+  const byDay = new Map();
+  const add = (day, event) => byDay.set(day, [...(byDay.get(day) || []), event]);
+  for (const project of programs) {
+    if (!project.startDate) continue;
+    const end = project.endDate && project.endDate >= project.startDate ? project.endDate : project.startDate;
+    const span = Math.min(60, Math.round((parseDay(end) - parseDay(project.startDate)) / 86400000));
+    for (let offset = 0; offset <= span; offset++) {
+      const day = shiftDay(project.startDate, offset);
+      const label = span === 0 ? project.name : offset === 0 ? `Starts · ${project.name}` : day === end ? `Ends · ${project.name}` : project.name;
+      add(day, { kind: "program", id: project.id, label, title: "Program dates", color: colorFor.get(project.id) });
+    }
+  }
+  const visible = new Set(programs.map((project) => project.id));
+  for (const task of state.data.tasks) {
+    if (!task.dueDate || !visible.has(task.projectId)) continue;
+    add(task.dueDate, { kind: "task", id: task.id, label: task.title, title: task.projectName, done: task.status === "Completed", overdue: isOverdue(task), color: colorFor.get(task.projectId) });
+  }
+  for (const events of byDay.values()) events.sort((a, b) => (a.kind === b.kind ? a.label.localeCompare(b.label) : a.kind === "program" ? -1 : 1));
+  return { byDay, programs, colorFor };
+}
+function calendarEventChip(event) {
+  const attr = event.kind === "program" ? `data-project="${escapeHtml(event.id)}"` : `data-task="${escapeHtml(event.id)}"`;
+  const style = event.kind === "program"
+    ? `background:${event.color.solid};color:#fff`
+    : `background:${event.color.soft};color:${event.color.text}`;
+  const flags = event.overdue ? " is-overdue" : event.done ? " is-done" : "";
+  const prefix = event.overdue ? "Overdue: " : event.done ? "Done: " : "";
+  return `<button type="button" class="calendar-event${flags}" ${attr} style="${style}" title="${escapeHtml(`${prefix}${event.label} · ${event.title}`)}">${event.overdue ? '<span class="calendar-flag" aria-hidden="true">!</span>' : ""}${escapeHtml(event.label)}<span class="sr-only"> · ${escapeHtml(event.title)}${event.overdue ? " (overdue)" : event.done ? " (done)" : ""}</span></button>`;
+}
+function renderCalendar() {
+  const { view, cursor, programId } = state.calendar;
+  const { start, days } = calendarRange();
+  const { byDay, programs, colorFor } = calendarEvents();
+  const anchor = parseDay(cursor);
+  const heading = view === "month"
+    ? anchor.toLocaleDateString(undefined, { month: "long", year: "numeric" })
+    : `${dateLabel(start, { month: "short", day: "numeric" })} – ${dateLabel(shiftDay(start, 6), { month: "short", day: "numeric", year: "numeric" })}`;
+  const limit = view === "month" ? 3 : Infinity;
+  const cells = Array.from({ length: days }, (_, index) => {
+    const day = shiftDay(start, index);
+    const inMonth = view === "week" || parseDay(day).getMonth() === anchor.getMonth();
+    const events = byDay.get(day) || [];
+    const shown = events.slice(0, limit);
+    const more = events.length - shown.length;
+    return `<div class="calendar-cell ${inMonth ? "" : "outside"} ${view === "week" ? "week" : ""}">
+      <div class="calendar-day ${day === today() ? "today" : ""}">${view === "week" ? `<span class="calendar-weekday">${parseDay(day).toLocaleDateString(undefined, { weekday: "short" })}</span>` : ""}${parseDay(day).getDate()}</div>
+      ${shown.map(calendarEventChip).join("")}
+      ${more > 0 ? `<button type="button" class="calendar-more" data-calendar-week="${day}">+${more} more</button>` : ""}
+    </div>`;
+  }).join("");
+  const legend = state.data.projects.filter((project) => programs.includes(project)).slice(0, 8)
+    .map((project) => `<span class="calendar-legend-item"><span class="calendar-swatch" style="background:${colorFor.get(project.id).solid}"></span>${escapeHtml(project.name)}</span>`).join("");
+  return `${pageHeading("SCHEDULE", "Calendar", "Program dates and task deadlines by month or week. Click any item to open it.")}
+    <div class="calendar-toolbar">
+      <div class="calendar-nav">
+        <button type="button" class="icon-button bordered" data-calendar-step="-1" aria-label="Previous ${view}">‹</button>
+        <h2 class="calendar-title">${escapeHtml(heading)}</h2>
+        <button type="button" class="icon-button bordered" data-calendar-step="1" aria-label="Next ${view}">›</button>
+        <button type="button" class="button small ghost" data-calendar-today>Today</button>
+      </div>
+      <div class="calendar-controls">
+        <div class="segmented" role="group" aria-label="Calendar view">
+          <button type="button" data-calendar-view="month" aria-pressed="${view === "month"}" class="${view === "month" ? "active" : ""}">Month</button>
+          <button type="button" data-calendar-view="week" aria-pressed="${view === "week"}" class="${view === "week" ? "active" : ""}">Week</button>
+        </div>
+        <label class="compact-filter">Program<select data-calendar-program><option value="all">All programs</option>${state.data.projects.map((project) => `<option value="${escapeHtml(project.id)}" ${programId === project.id ? "selected" : ""}>${escapeHtml(project.name)}</option>`).join("")}</select></label>
+      </div>
+    </div>
+    <div class="calendar-legend">${legend}<span class="calendar-legend-item key"><span class="calendar-swatch solid"></span>Program day</span><span class="calendar-legend-item key"><span class="calendar-swatch soft"></span>Task deadline</span></div>
+    <div class="calendar" role="grid" aria-label="${escapeHtml(heading)}">
+      <div class="calendar-head">${["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((name) => `<div>${name}</div>`).join("")}</div>
+      <div class="calendar-grid">${cells}</div>
+    </div>`;
+}
 function renderTemplates() {
   return `${pageHeading("REUSABLE WORKFLOWS", "Task templates", "Start each program with a repeatable checklist. Template tasks are generated relative to the program date and linked by prerequisites.")}
     <div class="template-grid">${state.data.templates.map((template)=>`<article class="template-card"><div class="eyebrow">${escapeHtml(template.programType)} PROGRAM</div><h2>${escapeHtml(template.name)}</h2><p>${escapeHtml(template.description)}</p><div class="template-meta"><span>${templateTaskCount(template.id)} tasks · relative deadlines</span>${isManager()?`<button class="button small ghost" data-edit-template="${escapeHtml(template.id)}">Edit template</button>`:`<span>Reusable</span>`}</div></article>`).join("")}</div>
@@ -470,7 +573,7 @@ function render() {
   document.getElementById("crumb-current").textContent = state.page.replaceAll("-"," ").replace(/\b\w/g,(letter)=>letter.toUpperCase());
   document.querySelectorAll(".nav-link").forEach((item)=>item.classList.toggle("active",item.dataset.nav===state.page&&!state.projectId));
   if (state.projectId && state.projectData) return renderProjectPage();
-  const renderers = { overview:renderOverview, projects:renderProjects, "my-tasks":renderMyTasks, timeline:renderTimeline, templates:renderTemplates, notifications:renderNotifications, settings:renderSettings, "airtable-data":renderAirtableData };
+  const renderers = { overview:renderOverview, projects:renderProjects, "my-tasks":renderMyTasks, timeline:renderTimeline, calendar:renderCalendar, templates:renderTemplates, notifications:renderNotifications, settings:renderSettings, "airtable-data":renderAirtableData };
   content.innerHTML = (renderers[state.page] || renderOverview)();
 }
 async function openTask(taskId) {
@@ -649,6 +752,18 @@ document.addEventListener("click",async(event)=>{
   if (airtablePage) { await loadAirtableRecords(Number(airtablePage.dataset.airtablePage)); return; }
   const projectLink = event.target.closest("[data-project]");
   if (projectLink) { await openProject(projectLink.dataset.project); return; }
+  const calendarView = event.target.closest("[data-calendar-view]");
+  if (calendarView) { state.calendar.view = calendarView.dataset.calendarView; render(); return; }
+  const calendarStep = event.target.closest("[data-calendar-step]");
+  if (calendarStep) {
+    const step = Number(calendarStep.dataset.calendarStep);
+    if (state.calendar.view === "week") state.calendar.cursor = shiftDay(state.calendar.cursor, step * 7);
+    else { const date = parseDay(state.calendar.cursor); state.calendar.cursor = isoDay(new Date(date.getFullYear(), date.getMonth() + step, 1)); }
+    render(); return;
+  }
+  if (event.target.closest("[data-calendar-today]")) { state.calendar.cursor = today(); render(); return; }
+  const calendarWeek = event.target.closest("[data-calendar-week]");
+  if (calendarWeek) { state.calendar = { ...state.calendar, view: "week", cursor: calendarWeek.dataset.calendarWeek }; render(); return; }
   const taskLink = event.target.closest("[data-task]");
   if (taskLink) { await openTask(taskLink.dataset.task); return; }
   const templateLink = event.target.closest("[data-edit-template]");
@@ -715,6 +830,7 @@ document.addEventListener("change",(event)=>{
   }
   if(event.target.matches('[data-filter="task-status"]')) { state.taskStatusFilter=event.target.value; render(); }
   if(event.target.matches('[data-filter="task-sort"]')) { state.taskSort=event.target.value; render(); }
+  if(event.target.matches("[data-calendar-program]")) { state.calendar.programId=event.target.value; render(); }
   if(event.target.id==="user-select") {
     state.userId=event.target.value;
     localStorage.setItem("nmu-demo-user",state.userId);
