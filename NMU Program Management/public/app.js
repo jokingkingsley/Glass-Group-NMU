@@ -25,6 +25,7 @@ const isAdmin = () => userRole() === "admin";
 const today = () => new Date().toISOString().slice(0, 10);
 const dayDiff = (date) => Math.round((Date.parse(`${date}T00:00:00Z`) - Date.parse(`${today()}T00:00:00Z`)) / 86400000);
 const isOverdue = (task) => task.status !== "Completed" && task.dueDate < today();
+const isMine = (task) => (task.assigneeIds || [task.assignedUserId]).includes(state.userId);
 const projectById = (id) => state.data?.projects.find((project) => project.id === id);
 const tasksForProject = (projectId) => state.data?.tasks.filter((task) => task.projectId === projectId) || [];
 function showToast(message, error = false) {
@@ -104,7 +105,8 @@ function progressMarkup(progress) {
 function pageHeading(eyebrow, title, description, actions = "") {
   return `<header class="page-heading"><div><div class="eyebrow">${escapeHtml(eyebrow)}</div><h1>${escapeHtml(title)}</h1><p class="heading-copy">${escapeHtml(description)}</p></div>${actions ? `<div class="heading-actions">${actions}</div>` : ""}</header>`;
 }
-function statCard(label, value, note, icon, tone = "") {
+function statCard(label, value, note, icon, tone = "", drill = "") {
+  if (drill) return `<button type="button" class="stat-card clickable" data-stat="${drill}" aria-haspopup="dialog"><div class="stat-top"><span>${escapeHtml(label)}</span><span class="stat-icon ${tone}">${icon}</span></div><div class="stat-value">${escapeHtml(value)}</div><div class="stat-foot">${escapeHtml(note)} <span class="stat-more" aria-hidden="true">View list ›</span></div></button>`;
   return `<article class="stat-card"><div class="stat-top"><span>${escapeHtml(label)}</span><span class="stat-icon ${tone}">${icon}</span></div><div class="stat-value">${escapeHtml(value)}</div><div class="stat-foot">${escapeHtml(note)}</div></article>`;
 }
 function projectTable(projects) {
@@ -186,9 +188,9 @@ function renderOverview() {
   const actions = `${isManager()?`<button class="button primary" data-action="create-project">＋ Create program</button>`:""}<button class="button ghost" data-nav="settings">↗ Airtable</button>`;
   return `${pageHeading("PROGRAM OPERATIONS", `Good morning, ${state.data.currentUser.name.split(" ")[0] || "team"}.`, "A clear view of every swim program, from early planning through the final report.", actions)}
     <div class="stat-grid" aria-label="Organization summary">
-      ${statCard("Active programs", active.length, `${projects.length} total programs`, "▦")}
-      ${statCard("Tasks due this week", dueSoon.length, "Across programs you can access", "◷", "blue")}
-      ${statCard("Overdue tasks", overdue.length, "Needs attention", "!", "red")}
+      ${statCard("Active programs", active.length, `${projects.length} total programs`, "▦", "", "active")}
+      ${statCard("Tasks due this week", dueSoon.length, "Next 7 days", "◷", "blue", "due-week")}
+      ${statCard("Overdue tasks", overdue.length, "Needs attention", "!", "red", "overdue")}
       ${statCard("Overall completion", `${completion}%`, `${completed} completed program${completed===1?"":"s"}`, "✓")}
     </div>
     <div class="dashboard-grid">
@@ -202,6 +204,35 @@ function renderOverview() {
       </div>
     </div>`;
 }
+function overviewLists() {
+  const tasks = state.data.tasks;
+  return {
+    active: state.data.projects.filter((project) => project.status !== "Completed").sort((a, b) => (a.startDate || "").localeCompare(b.startDate || "")),
+    "due-week": tasks.filter((task) => task.status !== "Completed" && dayDiff(task.dueDate) >= 0 && dayDiff(task.dueDate) <= 7).sort((a, b) => a.dueDate.localeCompare(b.dueDate)),
+    overdue: tasks.filter(isOverdue).sort((a, b) => a.dueDate.localeCompare(b.dueDate))
+  };
+}
+function showStatList(kind) {
+  const lists = overviewLists();
+  const items = lists[kind] || [];
+  const titles = { active: "Active programs", "due-week": "Tasks due this week", overdue: "Overdue tasks" };
+  const subtitles = {
+    active: "Programs that are not completed yet, by start date.",
+    "due-week": "Open tasks due in the next 7 days, soonest first.",
+    overdue: "Open tasks past their due date, oldest first."
+  };
+  const body = !items.length
+    ? `<div class="empty-state"><strong>Nothing here</strong>${kind === "overdue" ? "No overdue tasks — nice work." : "No items to show right now."}</div>`
+    : kind === "active"
+      ? `<ul class="stat-list">${items.map((project) => `<li><div class="stat-list-main"><button type="button" class="project-link" data-project="${escapeHtml(project.id)}">${escapeHtml(project.name)}</button><small>${escapeHtml(project.location || "")} · starts ${dateLabel(project.startDate, { month: "short", day: "numeric" })} · ${escapeHtml(project.projectManagerName || "No manager")}</small></div><div class="progress-wrap"><span class="progress-track"><span style="width:${project.progress}%"></span></span><span class="progress-number">${project.progress}%</span></div>${statusBadge(project.status)}</li>`).join("")}</ul>`
+      : `<ul class="stat-list">${items.map((task) => {
+          const days = dayDiff(task.dueDate);
+          const when = kind === "overdue" ? `${-days} day${days === -1 ? "" : "s"} late` : days === 0 ? "Due today" : `Due in ${days} day${days === 1 ? "" : "s"}`;
+          return `<li><div class="stat-list-main"><button type="button" class="task-link" data-task="${escapeHtml(task.id)}">${escapeHtml(task.title)}</button><small>${escapeHtml(task.projectName)} · ${escapeHtml(task.assigneeName || "Unassigned")}</small></div><span class="stat-list-date ${kind === "overdue" ? "overdue-text" : ""}">${dateLabel(task.dueDate, { month: "short", day: "numeric" })}<small>${when}</small></span><span>${priorityLabel(task.priority)}</span></li>`;
+        }).join("")}</ul>`;
+  modalRoot.innerHTML = `<div class="modal-backdrop" data-close-modal><section class="modal wide" role="dialog" aria-modal="true" aria-labelledby="stat-list-title"><header class="modal-head"><div><h2 id="stat-list-title">${escapeHtml(titles[kind])} · ${items.length}</h2><p>${escapeHtml(subtitles[kind])}</p></div><button class="modal-close" data-action="close-modal" aria-label="Close dialog">×</button></header><div class="modal-body">${body}</div></section></div>`;
+  modalRoot.querySelector(".modal-close")?.focus();
+}
 function renderProjects() {
   const actions = isManager() ? `<button class="button primary" data-action="create-project">＋ Create program</button>` : "";
   return `${pageHeading("PROGRAMS", "All programs", "Search programs, review deadlines, and open a workspace to coordinate the team.", actions)}
@@ -209,7 +240,7 @@ function renderProjects() {
 }
 function taskRow(task, compact = false) {
   const overdue = isOverdue(task);
-  const currentUserTask = task.assignedUserId === state.userId;
+  const currentUserTask = isMine(task);
   const status = task.isBlocked ? "Blocked" : task.status;
   return `<div class="${compact ? "my-task" : "task-row"}">
     <div class="${compact ? "my-task-info" : ""}"><button class="task-link" data-task="${escapeHtml(task.id)}">${escapeHtml(task.title)}</button><small class="${compact ? "" : "task-row-meta"}">${escapeHtml(task.projectName)}${task.assigneeName && !compact ? ` · ${escapeHtml(task.assigneeName)}` : ""}${task.milestone ? ` · ${escapeHtml(task.milestone)}` : ""}</small></div>
@@ -217,7 +248,7 @@ function taskRow(task, compact = false) {
   </div>`;
 }
 function renderMyTasks() {
-  const all = state.data.tasks.filter((task) => task.assignedUserId === state.userId);
+  const all = state.data.tasks.filter(isMine);
   const query = state.taskSearch.toLowerCase().trim();
   const searchable = all.filter((task) => !query || `${task.title} ${task.projectName} ${task.description}`.toLowerCase().includes(query));
   const groups = [
@@ -475,12 +506,12 @@ function projectTabs() {
 }
 function taskTable(tasks, projectId) {
   const external = userRole() === "external_partner";
-  const shown = external ? tasks.filter((task) => task.assignedUserId === state.userId) : tasks;
+  const shown = external ? tasks.filter(isMine) : tasks;
   return shown.length ? `<div class="table-wrap"><table class="task-table"><thead><tr><th>Task</th><th>Owner</th><th>Due</th><th>Priority</th><th>Status</th></tr></thead><tbody>${shown.map((task)=>`<tr><td><button class="task-link" data-task="${escapeHtml(task.id)}">${escapeHtml(task.title)}</button><span class="secondary-cell">${escapeHtml(task.milestone)}${task.isBlocked?" · Prerequisite incomplete":""}</span></td><td>${escapeHtml(task.assigneeName||"Unassigned")}</td><td>${dateLabel(task.dueDate,{month:"short",day:"numeric"})}</td><td>${priorityLabel(task.priority)}</td><td>${statusBadge(task.isBlocked?"Blocked":task.status,isOverdue(task))}</td></tr>`).join("")}</tbody></table></div>`:`<div class="empty-state"><strong>No tasks to display</strong>${external?"You only see tasks assigned to your partner account.":"This program has no tasks yet."}</div>`;
 }
 function renderProject(data) {
   const { project, tasks, members, activities, comments } = data;
-  const allowedTasks = userRole() === "external_partner" ? tasks.filter((task)=>task.assignedUserId===state.userId) : tasks;
+  const allowedTasks = userRole() === "external_partner" ? tasks.filter(isMine) : tasks;
   const canReplan = isAdmin() || (userRole()==="program_manager" && (project.projectManagerId===state.userId || members.some((member)=>member.id===state.userId)));
   const pageActions = canReplan ? `<button class="button primary" data-action="create-task">＋ Add task</button><button class="button ghost" data-action="replan">◷ Adjust dates</button>` : "";
   let pane = "";
@@ -560,7 +591,7 @@ function render() {
   if (select.innerHTML !== userOptions) select.innerHTML = userOptions;
   select.value = state.userId;
   document.getElementById("user-avatar").textContent = initials(user.name);
-  document.getElementById("my-task-count").textContent = state.data.tasks.filter((task)=>task.assignedUserId===state.userId&&task.status!=="Completed").length;
+  document.getElementById("my-task-count").textContent = state.data.tasks.filter((task)=>isMine(task)&&task.status!=="Completed").length;
   const unread = state.data.notifications.filter((item)=>!item.isRead).length;
   document.getElementById("notification-count").textContent = unread;
   document.getElementById("notification-indicator").classList.toggle("hidden",!unread);
@@ -577,6 +608,12 @@ function render() {
   const renderers = { overview:renderOverview, projects:renderProjects, "my-tasks":renderMyTasks, timeline:renderTimeline, calendar:renderCalendar, templates:renderTemplates, notifications:renderNotifications, settings:renderSettings, "airtable-data":renderAirtableData };
   content.innerHTML = (renderers[state.page] || renderOverview)();
 }
+// Current owners first (lead on top), then everyone else alphabetically.
+function ownerOptions(users, ownerIds) {
+  const rank = (user) => (ownerIds.includes(user.id) ? ownerIds.indexOf(user.id) : 1000);
+  return [...users].sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name))
+    .map((user) => `<label class="owner-option"><input type="checkbox" name="owners" value="${escapeHtml(user.id)}" ${ownerIds.includes(user.id) ? "checked" : ""}><span>${escapeHtml(user.name)}</span>${ownerIds[0] === user.id ? '<span class="owner-lead">Lead</span>' : ""}</label>`).join("");
+}
 async function openTask(taskId) {
   let task = state.data.tasks.find((item)=>item.id===taskId);
   if (!task) return;
@@ -590,11 +627,12 @@ async function openTask(taskId) {
   const managerControls = isAdmin() || (userRole()==="program_manager" && fullTask.canEdit);
   const users = state.data.users.filter((item)=>item.role!=="external_partner");
   const dependencies = fullTask.dependencies.length ? `<div class="form-field full"><label>Prerequisites</label><div class="integration-callout ${fullTask.isBlocked?"warning":""}">${fullTask.dependencies.map((item)=>`${escapeHtml(item.title)} — ${escapeHtml(item.status)}`).join("<br>")}</div></div>` : "";
-  modalRoot.innerHTML = `<div class="modal-backdrop" data-close-modal><section class="modal" role="dialog" aria-modal="true" aria-labelledby="task-modal-title"><header class="modal-head"><div><h2 id="task-modal-title">${escapeHtml(fullTask.title)}</h2><p>${escapeHtml(projectData.project.name)} · ${escapeHtml(fullTask.milestone)}</p></div><button class="modal-close" data-action="close-modal" aria-label="Close dialog">×</button></header><form id="task-form" data-task-id="${escapeHtml(taskId)}" data-original-due-date="${escapeHtml(fullTask.dueDate)}"><div class="modal-body">
-      <div class="form-grid"><div class="form-field"><label for="task-status">Status</label><select id="task-status" name="status"><option ${fullTask.status==="Not Started"?"selected":""}>Not Started</option><option ${fullTask.status==="In Progress"?"selected":""}>In Progress</option><option ${fullTask.status==="Completed"?"selected":""}>Completed</option></select></div>
-      ${managerControls?`<div class="form-field"><label for="task-assignee">Assigned to</label><select id="task-assignee" name="assignedUserId">${users.map((item)=>`<option value="${escapeHtml(item.id)}" ${item.id===fullTask.assignedUserId?"selected":""}>${escapeHtml(item.name)}</option>`).join("")}</select></div>`:`<div class="form-field"><label>Assigned to</label><input disabled value="${escapeHtml(fullTask.assigneeName||"Unassigned")}"></div>`}
-      <div class="form-field"><label for="task-due-date">Due date${managerControls?" · management override":""}</label><input id="task-due-date" name="dueDate" type="${managerControls?"date":"text"}" ${managerControls?`value="${escapeHtml(fullTask.dueDate)}"`:`disabled value="${dateLabel(fullTask.dueDate)}"`}></div><div class="form-field"><label>Priority</label><input disabled value="${escapeHtml(fullTask.priority)}"></div>
-      <div class="form-field full"><label>Description</label><div class="integration-callout">${escapeHtml(fullTask.description||"No task description.")}</div></div>${dependencies}</div>
+  modalRoot.innerHTML = `<div class="modal-backdrop" data-close-modal><section class="modal" role="dialog" aria-modal="true" aria-labelledby="task-modal-title"><header class="modal-head"><div><h2 id="task-modal-title">${escapeHtml(fullTask.title)}</h2><p>${escapeHtml(projectData.project.name)} · ${escapeHtml(fullTask.milestone)}</p></div><button class="modal-close" data-action="close-modal" aria-label="Close dialog">×</button></header><form id="task-form" data-task-id="${escapeHtml(taskId)}" data-original-due-date="${escapeHtml(fullTask.dueDate)}" data-original-status="${escapeHtml(fullTask.status==="Blocked"?"Not Started":fullTask.status)}" data-original-owners="${escapeHtml((fullTask.assigneeIds||[]).join(","))}"><div class="modal-body">
+      ${fullTask.canEdit?`<div class="form-grid" style="margin-bottom:12px"><div class="form-field full"><label for="task-title">Task name</label><input id="task-title" name="title" maxlength="200" required value="${escapeHtml(fullTask.title)}" data-original="${escapeHtml(fullTask.title)}"></div></div>`:""}
+      <div class="form-grid"><div class="form-field"><label for="task-status">Status</label><select id="task-status" name="status" ${fullTask.canEdit?"":"disabled"}><option ${fullTask.status==="Not Started"?"selected":""}>Not Started</option><option ${fullTask.status==="In Progress"?"selected":""}>In Progress</option><option ${fullTask.status==="Completed"?"selected":""}>Completed</option></select></div>
+      ${managerControls?`<fieldset class="form-field owner-picker"><legend>Task owners <span class="form-hint">· select one or more</span></legend><div class="owner-options">${ownerOptions(users,fullTask.assigneeIds||[])}</div></fieldset>`:`<div class="form-field"><label>Task owners</label><input disabled value="${escapeHtml(fullTask.assigneeName||"Unassigned")}"></div>`}
+      <div class="form-field"><label for="task-due-date">Due date${managerControls?" · management override":""}</label><input id="task-due-date" name="dueDate" type="${managerControls?"date":"text"}" ${managerControls?`value="${escapeHtml(fullTask.dueDate)}"`:`disabled value="${dateLabel(fullTask.dueDate)}"`}></div>${fullTask.canEdit?`<div class="form-field"><label for="task-priority">Priority</label><select id="task-priority" name="priority" data-original="${escapeHtml(fullTask.priority)}">${["High","Medium","Low"].map((level)=>`<option ${fullTask.priority===level?"selected":""}>${level}</option>`).join("")}</select></div>`:`<div class="form-field"><label>Priority</label><input disabled value="${escapeHtml(fullTask.priority)}"></div>`}
+      ${fullTask.canEdit?`<div class="form-field full"><label for="task-description">Description</label><textarea id="task-description" name="description" maxlength="4000" placeholder="What needs to happen, and anything the owner should know" data-original="${escapeHtml(fullTask.description||"")}">${escapeHtml(fullTask.description||"")}</textarea></div>`:`<div class="form-field full"><label>Description</label><div class="integration-callout">${escapeHtml(fullTask.description||"No task description.")}</div></div>`}${dependencies}</div>
       ${isAdmin()&&fullTask.isBlocked?`<div class="form-field" style="margin-top:12px"><label for="override-reason">Administrator override reason · required to bypass prerequisites</label><textarea id="override-reason" name="overrideReason" maxlength="500" placeholder="Record why this task must be completed before its prerequisites."></textarea></div>`:""}
       <div class="section-label">Task notes (${comments.length})</div>${comments.length?`<div class="comment-list">${comments.map((item)=>`<article class="comment"><strong>${escapeHtml(item.userName)} · ${dateLabel(item.createdAt,{month:"short",day:"numeric"})}</strong><p>${escapeHtml(item.content)}</p></article>`).join("")}</div>`:`<div class="form-hint" style="margin:0 0 9px">No notes yet. Add context for the next person who picks up this work.</div>`}
       <div class="form-field"><label for="task-comment">Add a note</label><textarea id="task-comment" name="comment" maxlength="2000" placeholder="Add an update or handoff note…"></textarea></div>
@@ -751,8 +789,10 @@ document.addEventListener("click",async(event)=>{
   }
   const airtablePage = event.target.closest("[data-airtable-page]");
   if (airtablePage) { await loadAirtableRecords(Number(airtablePage.dataset.airtablePage)); return; }
+  const statCardButton = event.target.closest("[data-stat]");
+  if (statCardButton) { showStatList(statCardButton.dataset.stat); return; }
   const projectLink = event.target.closest("[data-project]");
-  if (projectLink) { await openProject(projectLink.dataset.project); return; }
+  if (projectLink) { modalRoot.innerHTML = ""; await openProject(projectLink.dataset.project); return; }
   const calendarView = event.target.closest("[data-calendar-view]");
   if (calendarView) { state.calendar.view = calendarView.dataset.calendarView; render(); return; }
   const calendarStep = event.target.closest("[data-calendar-step]");
@@ -936,11 +976,27 @@ document.addEventListener("submit",async(event)=>{
     const save=event.target.querySelector('[type="submit"]');
     save.disabled=true;
     try {
+      const form=event.target;
+      const titleField=form.querySelector("#task-title");
+      if(titleField) {
+        const details={title:titleField.value.trim(),description:form.querySelector("#task-description").value.trim(),priority:form.querySelector("#task-priority").value};
+        if(details.title!==titleField.dataset.original||details.description!==form.querySelector("#task-description").dataset.original||details.priority!==form.querySelector("#task-priority").dataset.original) {
+          await api(`/api/tasks/${encodeURIComponent(taskId)}`,{method:"PATCH",body:JSON.stringify(details)});
+        }
+      }
+      const ownerBoxes=[...form.querySelectorAll('input[name="owners"]')];
+      if(ownerBoxes.length) {
+        const original=(form.dataset.originalOwners||"").split(",").filter(Boolean);
+        const checked=ownerBoxes.filter((box)=>box.checked).map((box)=>box.value);
+        const ordered=[...original.filter((id)=>checked.includes(id)),...checked.filter((id)=>!original.includes(id))];
+        if(!ordered.length&&original.length) throw new Error("Keep at least one task owner.");
+        const changed=ordered.length!==original.length||ordered.some((id,index)=>id!==original[index]);
+        if(ordered.length&&changed) await api(`/api/tasks/${encodeURIComponent(taskId)}/assignees`,{method:"PATCH",body:JSON.stringify({assignedUserIds:ordered})});
+      }
       if(event.target.querySelector("#task-due-date")?.type==="date"&&data.get("dueDate")!==event.target.dataset.originalDueDate) {
         await api(`/api/tasks/${encodeURIComponent(taskId)}/due-date`,{method:"PATCH",body:JSON.stringify({dueDate:data.get("dueDate")})});
       }
-      if(event.target.querySelector("#task-status")) await api(`/api/tasks/${encodeURIComponent(taskId)}/status`,{method:"PATCH",body:JSON.stringify({status:data.get("status"),overrideReason:data.get("overrideReason")||""})});
-      if(event.target.querySelector("#task-assignee")) await api(`/api/tasks/${encodeURIComponent(taskId)}/assignee`,{method:"PATCH",body:JSON.stringify({assignedUserId:data.get("assignedUserId")})});
+      if(event.target.querySelector("#task-status:not([disabled])")&&(data.get("status")!==event.target.dataset.originalStatus||data.get("overrideReason"))) await api(`/api/tasks/${encodeURIComponent(taskId)}/status`,{method:"PATCH",body:JSON.stringify({status:data.get("status"),overrideReason:data.get("overrideReason")||""})});
       if(comment) await api(`/api/tasks/${encodeURIComponent(taskId)}/comments`,{method:"POST",body:JSON.stringify({content:comment})});
       const projectId=state.data.tasks.find((task)=>task.id===taskId)?.projectId;
       modalRoot.innerHTML="";

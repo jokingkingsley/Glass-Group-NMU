@@ -186,6 +186,63 @@ test("NMU project, dependency, access, and timeline workflows", async (t) => {
     assert.ok(project.body.comments.some((item) => item.content === "Contacted the regional grant office."));
   });
 
+  await t.test("supports several owners per task with valid relationships", async () => {
+    const task = createdTasks.find((item) => item.title === "Research funding opportunities");
+    const patchOwners = (ids, user = "u-jordan") => request(`/api/tasks/${task.id}/assignees`, user, {
+      method: "PATCH", body: JSON.stringify({ assignedUserIds: ids })
+    });
+    assert.equal((await patchOwners(["u-casey"], "u-casey")).status, 403, "employees cannot change owners");
+    assert.equal((await patchOwners([])).status, 400);
+    assert.equal((await patchOwners(["u-missing"])).status, 400);
+    assert.equal((await patchOwners(["u-partner"])).status, 400, "external partners cannot own internal tasks");
+    const updated = await patchOwners(["u-mary", "u-casey"]);
+    assert.equal(updated.status, 200, JSON.stringify(updated.body));
+    const project = await request(`/api/projects/${createdProjectId}`, "u-jordan");
+    const stored = project.body.tasks.find((item) => item.id === task.id);
+    assert.deepEqual(stored.assigneeIds, ["u-mary", "u-casey"]);
+    assert.equal(stored.assignedUserId, "u-mary", "first owner stays the lead");
+    assert.equal(stored.assigneeName, "Mary, Casey Nguyen");
+    const casey = await request("/api/bootstrap", "u-casey");
+    const caseyTask = casey.body.tasks.find((item) => item.id === task.id);
+    assert.ok(caseyTask, "second owner sees the task");
+    assert.equal(caseyTask.canEdit, true, "second owner can update it");
+    assert.ok(casey.body.notifications.some((item) => item.message === `New task assigned: ${task.title}`));
+    const caseyStatus = await request(`/api/tasks/${task.id}/status`, "u-casey", { method: "PATCH", body: JSON.stringify({ status: "In Progress" }) });
+    assert.equal(caseyStatus.status, 200);
+    assert.ok(project.body.activities.some((item) => item.action === "Task owners updated"));
+    const unchanged = await patchOwners(["u-mary", "u-casey"]);
+    assert.equal(unchanged.body.unchanged, true);
+    // The single-owner endpoint and the owners list stay consistent.
+    assert.equal((await request(`/api/tasks/${task.id}/assignee`, "u-jordan", { method: "PATCH", body: JSON.stringify({ assignedUserId: "u-sam" }) })).status, 200);
+    const afterReassign = (await request(`/api/projects/${createdProjectId}`, "u-jordan")).body.tasks.find((item) => item.id === task.id);
+    assert.equal(afterReassign.assignedUserId, "u-sam");
+    assert.deepEqual([...afterReassign.assigneeIds].sort(), ["u-casey", "u-sam"]);
+    assert.equal((await patchOwners(["u-mary"])).status, 200);
+    const caseyAfter = await request("/api/bootstrap", "u-casey");
+    assert.equal(caseyAfter.body.tasks.find((item) => item.id === task.id)?.canEdit ?? false, false, "removed owner loses edit rights");
+  });
+
+  await t.test("edits task name, description and priority", async () => {
+    const task = createdTasks.find((item) => item.title === "Research funding opportunities");
+    const edit = (body, user = "u-jordan") => request(`/api/tasks/${task.id}`, user, { method: "PATCH", body: JSON.stringify(body) });
+    assert.equal((await edit({ priority: "Urgent" })).status, 400);
+    assert.equal((await edit({ title: " " })).status, 400);
+    assert.equal((await edit({ title: "x".repeat(201) })).status, 400);
+    assert.equal((await edit({ priority: "Low" }, "u-casey")).status, 404, "a non-owner employee cannot edit");
+    const saved = await edit({ title: "Research grant funding", description: "Shortlist 3 regional grants.", priority: "High" });
+    assert.equal(saved.status, 200, JSON.stringify(saved.body));
+    const ownerEdit = await edit({ priority: "Medium" }, "u-mary");
+    assert.equal(ownerEdit.status, 200, "an owner can edit their task");
+    const project = await request(`/api/projects/${createdProjectId}`, "u-jordan");
+    const stored = project.body.tasks.find((item) => item.id === task.id);
+    assert.equal(stored.title, "Research grant funding");
+    assert.equal(stored.description, "Shortlist 3 regional grants.");
+    assert.equal(stored.priority, "Medium");
+    assert.ok(project.body.activities.some((item) => item.action === "Task edited" && item.details.includes("priority Medium → High")));
+    assert.equal((await edit({ priority: "Medium" })).body.unchanged, true);
+    createdTasks.find((item) => item.id === task.id).title = stored.title;
+  });
+
   await t.test("blocks task completion until prerequisites are complete", async () => {
     const backgroundCheck = createdTasks.find((task) => task.title === "Complete background checks");
     const recruitInstructors = createdTasks.find((task) => task.title === "Recruit instructors");

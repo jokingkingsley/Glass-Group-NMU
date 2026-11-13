@@ -355,3 +355,24 @@ fieldset.form-field { min-width: 0; margin: 0; padding: 9px; border: 1px solid #
   .calendar-head div { padding: 8px 4px; }
   .calendar-legend-item.key:first-of-type { margin-left: 0; }
 }
+
+/* Clickable overview cards and their list dialog */
+button.stat-card { width: 100%; font: inherit; color: inherit; text-align: left; cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease; }
+button.stat-card:hover { border-color: #b9bde6; box-shadow: 0 6px 18px rgba(44,49,133,.10); }
+.stat-more { float: right; color: var(--deep); font-weight: 700; }
+.stat-list { margin: 0; padding: 0; list-style: none; }
+.stat-list li { display: grid; grid-template-columns: minmax(0,1fr) auto auto; align-items: center; gap: 14px; padding: 12px 2px; border-bottom: 1px solid var(--line); }
+.stat-list li:last-child { border-bottom: 0; }
+.stat-list-main { min-width: 0; }
+.stat-list-main small { display: block; margin-top: 3px; color: #5b6185; font-size: 11px; }
+.stat-list-date { display: grid; justify-items: end; font-weight: 700; font-size: 12px; white-space: nowrap; }
+.stat-list-date small { color: #5b6185; font-weight: 500; font-size: 10.5px; }
+.stat-list-date.overdue-text small { color: var(--red); }
+/* Task owners picker */
+.owner-picker { grid-column: 1 / -1; min-width: 0; margin: 0; padding: 0; border: 0; }
+.owner-picker legend { margin-bottom: 6px; padding: 0; font-weight: 600; }
+.owner-options { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); max-height: 112px; overflow-y: auto; gap: 2px; padding: 6px; border: 1px solid var(--line); border-radius: 8px; background: var(--white); }
+.owner-option { display: flex; align-items: center; gap: 8px; min-height: 30px; padding: 0 6px; border-radius: 6px; cursor: pointer; }
+.owner-option:hover { background: var(--paper); }
+.owner-option input { width: 16px; height: 16px; accent-color: var(--deep); }
+.owner-lead { margin-left: auto; padding: 1px 7px; border-radius: 10px; background: var(--sky-soft); color: var(--deep); font-size: 10px; font-weight: 700; }

@@ -98,8 +98,30 @@ database.exec(`
   );
   CREATE INDEX IF NOT EXISTS task_project_idx ON tasks(project_id);
   CREATE INDEX IF NOT EXISTS task_assignee_idx ON tasks(assigned_user_id);
+  -- A task can have several owners. tasks.assigned_user_id stays the primary owner
+  -- (used by Airtable sync and older code); the triggers keep both in step.
+  CREATE TABLE IF NOT EXISTS task_assignees (
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    position INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(task_id,user_id)
+  );
+  CREATE INDEX IF NOT EXISTS task_assignees_user_idx ON task_assignees(user_id);
+  CREATE TRIGGER IF NOT EXISTS task_primary_owner_insert AFTER INSERT ON tasks
+    WHEN NEW.assigned_user_id IS NOT NULL
+    BEGIN INSERT OR IGNORE INTO task_assignees(task_id,user_id,position) VALUES(NEW.id,NEW.assigned_user_id,0); END;
+  CREATE TRIGGER IF NOT EXISTS task_primary_owner_update AFTER UPDATE OF assigned_user_id ON tasks
+    WHEN OLD.assigned_user_id IS NOT NEW.assigned_user_id
+    BEGIN
+      DELETE FROM task_assignees WHERE task_id=NEW.id AND user_id=OLD.assigned_user_id;
+      INSERT OR IGNORE INTO task_assignees(task_id,user_id,position)
+        SELECT NEW.id,NEW.assigned_user_id,0 WHERE NEW.assigned_user_id IS NOT NULL;
+    END;
   CREATE INDEX IF NOT EXISTS activity_project_idx ON activity_logs(project_id,created_at);
 `);
+// Existing databases: give every task's primary owner a task_assignees row.
+database.exec(`INSERT OR IGNORE INTO task_assignees(task_id,user_id,position)
+  SELECT id,assigned_user_id,0 FROM tasks WHERE assigned_user_id IS NOT NULL`);
 const userColumns = new Set(database.prepare("PRAGMA table_info(users)").all().map((column) => column.name));
 if (!userColumns.has("password_hash")) database.exec("ALTER TABLE users ADD COLUMN password_hash TEXT");
 if (!userColumns.has("is_active")) database.exec("ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1");
@@ -350,15 +372,17 @@ function canAccessProject(user, projectId) {
     return project?.project_manager_id === user.id || isMember(projectId, user.id);
   }
   return isMember(projectId, user.id) || Boolean(database.prepare(
-    "SELECT 1 FROM tasks WHERE project_id=? AND assigned_user_id=?"
+    "SELECT 1 FROM tasks t JOIN task_assignees ta ON ta.task_id=t.id WHERE t.project_id=? AND ta.user_id=?"
   ).get(projectId, user.id));
 }
 function canViewProject(user, projectId) {
   return user.role === "program_manager" || canAccessProject(user, projectId);
 }
+const isTaskOwner = (taskId, userId) => Boolean(database.prepare(
+  "SELECT 1 FROM task_assignees WHERE task_id=? AND user_id=?").get(taskId, userId));
 function canEditTask(user, task) {
   return canManage(user) || (user.role === "program_manager" && canAccessProject(user, task.project_id))
-    || (["employee", "external_partner"].includes(user.role) && task.assigned_user_id === user.id);
+    || (["employee", "external_partner"].includes(user.role) && isTaskOwner(task.id, user.id));
 }
 function logActivity(projectId, taskId, userId, action, details) {
   database.prepare("INSERT INTO activity_logs(id,project_id,task_id,user_id,action,details,created_at) VALUES(?,?,?,?,?,?,?)")
@@ -370,7 +394,7 @@ function notifyUser(userId, projectId, message) {
 }
 const projectRows = (user) => {
   const where = canManage(user) || user.role === "program_manager" ? ""
-    : "WHERE EXISTS(SELECT 1 FROM project_members pm WHERE pm.project_id=p.id AND pm.user_id=?) OR EXISTS(SELECT 1 FROM tasks t WHERE t.project_id=p.id AND t.assigned_user_id=?)";
+    : "WHERE EXISTS(SELECT 1 FROM project_members pm WHERE pm.project_id=p.id AND pm.user_id=?) OR EXISTS(SELECT 1 FROM tasks t JOIN task_assignees ta ON ta.task_id=t.id WHERE t.project_id=p.id AND ta.user_id=?)";
   const params = canManage(user) || user.role === "program_manager" ? [] : [user.id, user.id];
   return database.prepare(`SELECT p.*,u.name AS manager_name,
     (SELECT COUNT(*) FROM tasks t WHERE t.project_id=p.id) AS task_count,
@@ -378,6 +402,9 @@ const projectRows = (user) => {
     FROM projects p LEFT JOIN users u ON u.id=p.project_manager_id ${where} ORDER BY p.start_date`).all(...params);
 };
 const taskRows = (projectId) => database.prepare(`SELECT t.*,u.name AS assignee_name,
+    COALESCE((SELECT json_group_array(json_object('id',x.id,'name',x.name)) FROM
+      (SELECT au.id,au.name FROM task_assignees ta JOIN users au ON au.id=ta.user_id
+        WHERE ta.task_id=t.id ORDER BY ta.position,au.name) x),'[]') AS assignees_json,
     COALESCE((SELECT json_group_array(json_object('id',p.id,'title',p.title,'status',p.status))
       FROM task_dependencies d JOIN tasks p ON p.id=d.prerequisite_task_id WHERE d.task_id=t.id),'[]') AS dependencies_json
     FROM tasks t LEFT JOIN users u ON u.id=t.assigned_user_id WHERE t.project_id=? ORDER BY t.due_date,t.title`).all(projectId);
@@ -386,7 +413,11 @@ function taskResponse(row, viewer) {
   const isBlocked = row.status !== "Completed" && dependencies.some((item) => item.status !== "Completed");
   return {
     id: row.id, projectId: row.project_id, title: row.title, description: row.description,
-    assignedUserId: row.assigned_user_id, assigneeName: row.assignee_name, status: isBlocked ? "Blocked" : row.status,
+    assignedUserId: row.assigned_user_id,
+    assignees: JSON.parse(row.assignees_json || "[]"),
+    assigneeIds: JSON.parse(row.assignees_json || "[]").map((item) => item.id),
+    assigneeName: JSON.parse(row.assignees_json || "[]").map((item) => item.name).join(", ") || row.assignee_name,
+    status: isBlocked ? "Blocked" : row.status,
     priority: row.priority, dueDate: row.due_date, dueDateOverride: Boolean(row.due_date_override),
     milestone: row.milestone, completedAt: row.completed_at, isBlocked,
     dependencies, canEdit: canEditTask(viewer, row)
@@ -881,7 +912,7 @@ async function handleApi(request, response, url) {
     const projects = projectRows(user).map(projectResponse);
     const visibleIds = new Set(projects.map((project) => project.id));
     const tasks = projects.flatMap((project) => taskRows(project.id)
-      .filter((task) => user.role !== "external_partner" || task.assigned_user_id === user.id)
+      .filter((task) => user.role !== "external_partner" || isTaskOwner(task.id, user.id))
       .map((task) => ({ ...taskResponse(task, user), projectName: project.name, projectStatus: project.status })));
     const notifications = database.prepare("SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 20").all(user.id)
       .map((item) => ({ id: item.id, message: item.message, isRead: Boolean(item.is_read), createdAt: item.created_at, projectId: item.project_id }));
@@ -960,7 +991,7 @@ async function handleApi(request, response, url) {
       WHERE a.project_id=? ORDER BY a.created_at DESC LIMIT 30`).all(projectId)
       .map((item) => ({ id: item.id, action: item.action, details: item.details, createdAt: item.created_at, userName: item.user_name || "System" }));
     const tasks = taskRows(projectId)
-      .filter((item) => user.role !== "external_partner" || item.assigned_user_id === user.id)
+      .filter((item) => user.role !== "external_partner" || isTaskOwner(item.id, user.id))
       .map((item) => taskResponse(item, user));
     const visibleMembers = user.role === "external_partner" ? members.filter((member) => member.id === user.id) : members;
     const comments = database.prepare(`SELECT c.*,u.name AS user_name FROM task_comments c JOIN users u ON u.id=c.user_id
@@ -1122,7 +1153,11 @@ async function handleApi(request, response, url) {
     const newlyReady = database.prepare(`SELECT t.id,t.title,t.assigned_user_id FROM task_dependencies d JOIN tasks t ON t.id=d.task_id
       WHERE d.prerequisite_task_id=? AND t.status='Not Started' AND NOT EXISTS
       (SELECT 1 FROM task_dependencies d2 JOIN tasks p ON p.id=d2.prerequisite_task_id WHERE d2.task_id=t.id AND p.status!='Completed')`).all(taskId);
-    for (const ready of newlyReady) notifyUser(ready.assigned_user_id || user.id, task.project_id, `Task is now ready: ${ready.title}`);
+    const ownersOf = database.prepare("SELECT user_id FROM task_assignees WHERE task_id=? ORDER BY position");
+    for (const ready of newlyReady) {
+      const owners = ownersOf.all(ready.id).map((row) => row.user_id);
+      for (const ownerId of owners.length ? owners : [user.id]) notifyUser(ownerId, task.project_id, `Task is now ready: ${ready.title}`);
+    }
     return send(response, 200, { ok: true });
   }
   if (request.method === "PATCH" && path.startsWith("/api/tasks/") && path.endsWith("/due-date")) {
@@ -1140,7 +1175,7 @@ async function handleApi(request, response, url) {
     const taskId = decodeURIComponent(path.slice("/api/tasks/".length, -"/comments".length));
     const task = database.prepare("SELECT * FROM tasks WHERE id=?").get(taskId);
     if (!task || !canAccessProject(user, task.project_id)
-      || (user.role === "external_partner" && task.assigned_user_id !== user.id)) return send(response, 404, { error: "Task not found." });
+      || (user.role === "external_partner" && !isTaskOwner(task.id, user.id))) return send(response, 404, { error: "Task not found." });
     const input = await readBody(request);
     const content = String(input.content || "").trim();
     if (!content || content.length > 2000) return send(response, 400, { error: "Enter a comment of 1–2,000 characters." });
@@ -1148,6 +1183,58 @@ async function handleApi(request, response, url) {
       .run(randomUUID(), taskId, user.id, content, nowISO());
     logActivity(task.project_id, taskId, user.id, "Comment added", content);
     return send(response, 201, { ok: true });
+  }
+  if (request.method === "PATCH" && path.startsWith("/api/tasks/") && path.endsWith("/assignees")) {
+    if (!["admin", "program_manager"].includes(user.role)) return send(response, 403, { error: "Only management and program managers can change task owners." });
+    const taskId = decodeURIComponent(path.slice("/api/tasks/".length, -"/assignees".length));
+    const task = database.prepare("SELECT * FROM tasks WHERE id=?").get(taskId);
+    if (!task || !canAccessProject(user, task.project_id)) return send(response, 404, { error: "Task not found." });
+    const input = await readBody(request);
+    const ids = Array.isArray(input.assignedUserIds) ? [...new Set(input.assignedUserIds.map(String))] : null;
+    if (!ids || !ids.length || ids.length > 8) return send(response, 400, { error: "Choose between 1 and 8 task owners." });
+    const owners = ids.map((id) => getUser(id));
+    if (owners.some((owner) => !owner || owner.role === "external_partner")) return send(response, 400, { error: "Task owners must be active internal teammates." });
+    const before = database.prepare("SELECT user_id FROM task_assignees WHERE task_id=?").all(taskId).map((row) => row.user_id);
+    const unchanged = before.length === ids.length && ids.every((id) => before.includes(id)) && task.assigned_user_id === ids[0];
+    if (unchanged) return send(response, 200, { ok: true, unchanged: true });
+    database.exec("BEGIN");
+    try {
+      database.prepare("UPDATE tasks SET assigned_user_id=?,updated_at=? WHERE id=?").run(ids[0], nowISO(), taskId);
+      database.prepare("DELETE FROM task_assignees WHERE task_id=?").run(taskId);
+      const insertOwner = database.prepare("INSERT INTO task_assignees(task_id,user_id,position) VALUES(?,?,?)");
+      const addMember = database.prepare("INSERT OR IGNORE INTO project_members(project_id,user_id,project_role) VALUES(?,?,?)");
+      ids.forEach((id, index) => { insertOwner.run(taskId, id, index); addMember.run(task.project_id, id, "Team Member"); });
+      logActivity(task.project_id, taskId, user.id, "Task owners updated", `${task.title} owners: ${owners.map((owner) => owner.name).join(", ")}.`);
+      for (const owner of owners) {
+        if (!before.includes(owner.id) && owner.id !== user.id) notifyUser(owner.id, task.project_id, `New task assigned: ${task.title}`);
+      }
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+    return send(response, 200, { ok: true });
+  }
+  if (request.method === "PATCH" && /^\/api\/tasks\/[^/]+$/.test(path)) {
+    const taskId = decodeURIComponent(path.slice("/api/tasks/".length));
+    const task = database.prepare("SELECT * FROM tasks WHERE id=?").get(taskId);
+    if (!task || !canEditTask(user, task)) return send(response, 404, { error: "Task not found or you do not have permission to edit it." });
+    const input = await readBody(request);
+    const title = input.title === undefined ? task.title : String(input.title).trim();
+    const description = input.description === undefined ? task.description : String(input.description).trim();
+    const priority = input.priority === undefined ? task.priority : String(input.priority);
+    if (!title || title.length > 200) return send(response, 400, { error: "Enter a task name of 1–200 characters." });
+    if (description.length > 4000) return send(response, 400, { error: "Keep the description under 4,000 characters." });
+    if (!["High", "Medium", "Low"].includes(priority)) return send(response, 400, { error: "Choose High, Medium, or Low priority." });
+    const changes = [
+      title !== task.title ? `name "${task.title}" → "${title}"` : "",
+      description !== (task.description || "") ? "description updated" : "",
+      priority !== task.priority ? `priority ${task.priority} → ${priority}` : ""
+    ].filter(Boolean);
+    if (!changes.length) return send(response, 200, { ok: true, unchanged: true });
+    database.prepare("UPDATE tasks SET title=?,description=?,priority=?,updated_at=? WHERE id=?").run(title, description, priority, nowISO(), taskId);
+    logActivity(task.project_id, taskId, user.id, "Task edited", `${title}: ${changes.join("; ")}.`);
+    return send(response, 200, { ok: true });
   }
   if (request.method === "PATCH" && path.startsWith("/api/tasks/") && path.endsWith("/assignee")) {
     if (!["admin", "program_manager"].includes(user.role)) return send(response, 403, { error: "Only management and program managers can reassign tasks." });
