@@ -151,6 +151,15 @@ export function createAirtableStore({ client, cacheMs = 15_000, schemaCacheMs = 
     const picked = live?.choices?.find((item) => options.includes(item.toLowerCase())) || value;
     return live?.type === "multipleSelects" ? [picked] : picked;
   }
+  // Like choice(), but returns undefined when the base's select has no matching option,
+  // so an optional value is left empty instead of failing the whole write (a token
+  // without Creator access can't add new options to a select).
+  async function optionalChoice(table, field, value) {
+    const live = await liveField(table, field);
+    if (!["singleSelect", "multipleSelects"].includes(live?.type)) return choice(table, field, value);
+    const picked = await choice(table, field, value);
+    return (live.choices || []).includes(Array.isArray(picked) ? picked[0] : picked) ? picked : undefined;
+  }
   async function assertWritable(table, names) {
     // A field added since the schema was cached (e.g. by airtable:setup) shouldn't
     // need a restart: re-read the schema once before reporting it missing.
@@ -228,7 +237,7 @@ export function createAirtableStore({ client, cacheMs = 15_000, schemaCacheMs = 
     const templates = templateRecords.filter((record) => !/archiv|inactive|retired/i.test(textValue(record.fields?.[F.templates.status]))).map((record) => ({
       id: record.id,
       name: textValue(record.fields?.[F.templates.name]) || textValue(Object.values(record.fields || {})[0]) || record.id,
-      program_type: textValue(record.fields?.[F.templates.deliveryType]) || "Community",
+      program_type: textValue(record.fields?.[F.templates.deliveryType]),
       description: textValue(record.fields?.[F.templates.description])
     })).sort((a, b) => a.name.localeCompare(b.name));
     const stepsById = new Map(stepRecords.map((record) => [record.id, record]));
@@ -303,6 +312,9 @@ export function createAirtableStore({ client, cacheMs = 15_000, schemaCacheMs = 
         status: programStatusToApp(f[F.sessions.status]),
         project_manager_id: linkedIds(f[F.sessions.manager])[0] || null,
         team_ids: linkedIds(f[F.sessions.team]),
+        // The JSON as stored, for writing back; `details` below adds derived values.
+        raw_details: details,
+        deleted_at: textValue(details.deletedAt) || null, deleted_by: textValue(details.deletedBy) || null,
         details: {
           ...details, city, state,
           deliveryType: details.deliveryType || "",
@@ -314,6 +326,18 @@ export function createAirtableStore({ client, cacheMs = 15_000, schemaCacheMs = 
         created_at: record.createdTime
       });
     }
+    // Programs moved to the trash keep their records but drop out of every view
+    // (their tasks, comments and files too) until restored.
+    const trashedProjects = projects.filter((project) => project.deleted_at)
+      .sort((a, b) => String(b.deleted_at).localeCompare(String(a.deleted_at)));
+    for (let index = projects.length - 1; index >= 0; index--) if (projects[index].deleted_at) projects.splice(index, 1);
+    const trashedById = new Map(trashedProjects.map((project) => [project.id, project]));
+    const trashedTaskCounts = new Map();
+    for (const record of workRecords) {
+      const id = linkedIds(record.fields?.[F.work.session]).find((item) => trashedById.has(item));
+      if (id) trashedTaskCounts.set(id, (trashedTaskCounts.get(id) || 0) + 1);
+    }
+    trashedProjects.forEach((project) => { project.task_count = trashedTaskCounts.get(project.id) || 0; });
     projects.sort((a, b) => a.start_date.localeCompare(b.start_date) || a.name.localeCompare(b.name));
     const projectsById = new Map(projects.map((project) => [project.id, project]));
 
@@ -394,7 +418,7 @@ export function createAirtableStore({ client, cacheMs = 15_000, schemaCacheMs = 
     const newestFirst = (a, b) => String(b.created_at).localeCompare(String(a.created_at));
     comments.sort(newestFirst); activities.sort(newestFirst); notifications.sort(newestFirst); resources.sort(newestFirst);
 
-    return { users, usersById, templates, templateTasks, projects, projectsById, tasks, tasksById, comments, activities, notifications, resources, regions, sites, sitesById };
+    return { users, usersById, templates, templateTasks, projects, projectsById, tasks, tasksById, comments, activities, notifications, resources, regions, sites, sitesById, trashedProjects, trashedById };
   }
 
   // ------------------------------------------------------------ writing
@@ -446,8 +470,15 @@ export function createAirtableStore({ client, cacheMs = 15_000, schemaCacheMs = 
     set("stepId", F.work.step, (id) => (id ? [id] : []));
     set("ownerIds", F.work.owners, (ids) => [...new Set(ids)]);
     set("prerequisiteIds", F.work.prerequisites, (ids) => [...new Set(ids)]);
-    if (input.priority !== undefined) fields[F.work.priority] = await choice(T.work, F.work.priority, input.priority);
-    if (input.status !== undefined) fields[F.work.status] = await choice(T.work, F.work.status, input.status);
+    if (input.priority !== undefined) {
+      const priority = await optionalChoice(T.work, F.work.priority, input.priority);
+      if (priority !== undefined) fields[F.work.priority] = priority;
+    }
+    if (input.status !== undefined) {
+      // A new task with no matching "Not Started" option is simply left blank (= not started).
+      const status = input.status === "Not Started" ? await optionalChoice(T.work, F.work.status, input.status) : await choice(T.work, F.work.status, input.status);
+      if (status !== undefined) fields[F.work.status] = status;
+    }
     if (input.completedAt !== undefined) {
       fields[F.work.completedDate] = input.completedAt ? await dateFor(T.work, F.work.completedDate, input.completedAt) : null;
     }
@@ -498,7 +529,8 @@ export function createAirtableStore({ client, cacheMs = 15_000, schemaCacheMs = 
     for (const step of changes) {
       records.push({ id: step.id, fields: {
         [F.steps.title]: step.title, [F.steps.description]: step.description, [F.steps.days]: step.relativeDueDays,
-        [F.steps.priority]: await choice(T.steps, F.steps.priority, step.priority), [F.steps.milestone]: step.milestone
+        ...await (async () => { const priority = await optionalChoice(T.steps, F.steps.priority, step.priority); return priority === undefined ? {} : { [F.steps.priority]: priority }; })(),
+        [F.steps.milestone]: step.milestone
       } });
     }
     await update(T.steps, records);
@@ -538,6 +570,12 @@ export function createAirtableStore({ client, cacheMs = 15_000, schemaCacheMs = 
     return attachment?.url || null;
   }
   const removeResource = (id) => destroy(T.resources, [id]);
+  // IDs of records in `table` whose link field (by schema key, e.g. "session") points at `id`.
+  async function recordIdsLinkedTo(table, key, id) {
+    const field = Object.entries(T).find(([, name]) => name === table)?.[0];
+    const records = await loadTable(table).catch(() => []);
+    return records.filter((record) => linkedIds(record.fields?.[F[field][key]]).includes(id)).map((record) => record.id);
+  }
 
   async function checkSchema() {
     const tables = await schema({ fresh: true });
@@ -569,6 +607,6 @@ export function createAirtableStore({ client, cacheMs = 15_000, schemaCacheMs = 
     client, schema, model, invalidate, loadTable, status, checkSchema, browseTable,
     createUser, updateUser, createProject, updateProject, createTasks, updateTasks, deleteRecords,
     addComment, logActivity, notify, markNotificationRead, updateTemplate, updateSteps,
-    addLink, addFile, freshFileUrl, removeResource, createSite
+    addLink, addFile, freshFileUrl, removeResource, createSite, recordIdsLinkedTo
   };
 }

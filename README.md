@@ -124,5 +124,5 @@ The tests (`npm test`) run the whole app against a fake Airtable API that behave
 
 **Safeguards**
 - The app never writes Airtable's formula or lookup fields: `Session Name`, `End Date`, `Due Date`, `Status`, `Assignee` and `Effective Due Date`.
-- It never deletes programs or tasks. Removing a file or link in the app deletes only that `Resources` record.
+- Deleting a program moves it to the **trash** (Programs → Trash): it's hidden from everyone but stays in Airtable and can be restored. Only an admin can delete a trashed program for good, which removes its Session, Work and Resources records. Removing a file or link deletes only that `Resources` record.
 - Demo data from `dev:mock` or `npm run airtable:seed -- --demo` is fictional.

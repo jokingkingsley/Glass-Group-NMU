@@ -623,3 +623,56 @@ button.stat-card:hover .stat-more { text-decoration: underline; }
 @media (max-width: 780px) { .templates-page .template-grid { grid-template-columns: 1fr; } }
 .templates-note { font-size: 13px; padding: 12px 16px; }
 .templates-page .template-card { min-height: 160px; }
+
+/* Modals: header and buttons always visible; only the middle scrolls (fixes cut-off buttons). */
+.modal { display: flex; flex-direction: column; max-height: calc(100vh - 36px); }
+.modal > form { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+.modal-head, .modal-actions { flex: 0 0 auto; }
+.modal-body { flex: 1 1 auto; min-height: 0; max-height: none; overflow: auto; }
+.modal.wide { width: min(880px, 100%); }
+.modal-actions { align-items: center; }
+.modal-summary { margin-right: auto; color: var(--muted); font-size: 13px; }
+.button.danger { border-color: #f0c9c3; color: #ad5144; }
+.button.danger:hover { background: #fbeeec; }
+.button.primary.danger { border-color: #b4483b; background: #b4483b; color: white; }
+.button.primary.danger:hover { background: #9c3c31; }
+
+/* Create program: numbered sections. */
+.form-section { padding: 4px 0 18px; border-bottom: 1px solid var(--line); }
+.form-section + .form-section { padding-top: 18px; }
+.form-section > header, .form-section > summary { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 14px; }
+.form-section h3 { margin: 2px 0 0; color: var(--ink); font: 700 15px "Manrope", sans-serif; }
+.form-section header p, .form-section summary p { margin: 3px 0 0; color: var(--muted); font-size: 12.5px; }
+.form-step { display: grid; place-items: center; flex: 0 0 26px; width: 26px; height: 26px; border-radius: 50%; background: var(--deep); color: white; font-size: 12px; font-weight: 700; }
+.form-section.optional { border-bottom: 0; }
+.form-section.optional summary { list-style: none; margin-bottom: 0; cursor: pointer; }
+.form-section.optional summary::-webkit-details-marker { display: none; }
+.form-section.optional summary .form-step { background: #c9cbe0; }
+.form-section.optional[open] summary { margin-bottom: 14px; }
+.form-section.optional summary h3::after { content: " ▸"; color: var(--muted); }
+.form-section.optional[open] summary h3::after { content: " ▾"; }
+/* Team picker */
+.team-picker { margin: 0; padding: 0; border: 0; }
+.team-picker legend { margin-bottom: 7px; color: var(--muted); font-size: 12px; font-weight: 600; }
+.team-count { margin-left: 6px; color: var(--deep); }
+.team-search { width: 100%; height: 36px; margin-bottom: 9px; padding: 0 11px; border: 1px solid #d9dbe7; border-radius: 8px; font: inherit; font-size: 13px; }
+.team-options { display: flex; flex-wrap: wrap; gap: 7px; max-height: 168px; overflow: auto; }
+.team-chip { display: inline-flex; align-items: center; gap: 7px; padding: 7px 11px; border: 1px solid #d9dbe7; border-radius: 999px; background: white; cursor: pointer; font-size: 13px; }
+.team-chip input { margin: 0; accent-color: var(--deep); }
+.team-chip small { color: var(--faint); font-size: 11px; }
+.team-chip:has(input:checked) { border-color: var(--deep); background: #eef0fb; color: var(--deep); }
+.team-chip.locked { cursor: default; opacity: .85; }
+.team-chip[hidden] { display: none; }
+.plan-note { margin: 6px 0 10px; padding: 9px 11px; border-radius: 8px; background: #fff7e8; color: #7a5413; font-size: 12.5px; }
+.preview-more { margin: 8px 0 0; color: var(--muted); font-size: 12.5px; }
+.preview-box h3 { font-size: 14px; }
+.preview-task { font-size: 13px; }
+/* Trash list */
+.trash-list { display: grid; gap: 8px; }
+.trash-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; }
+.trash-row strong { display: block; font-size: 14px; }
+.trash-row small { color: var(--muted); font-size: 12px; }
+.trash-actions { display: flex; gap: 8px; flex: 0 0 auto; }
+@media (max-width: 780px) { .trash-row { flex-direction: column; align-items: flex-start; } }
+.team-chip input[type="checkbox"] { width: 16px; height: 16px; min-height: 0; flex: 0 0 16px; padding: 0; border: 0; box-shadow: none; }
+.team-chip span, .team-chip small { white-space: nowrap; }

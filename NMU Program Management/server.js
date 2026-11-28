@@ -8,6 +8,7 @@ import { createHash, createHmac, randomBytes, scryptSync, timingSafeEqual } from
 import { airtableClientFromEnv } from "./airtable-client.js";
 import { createAirtableStore, addDays, isValidDate as validateDate } from "./airtable-store.js";
 import { T, MAX_UPLOAD_BYTES } from "./airtable-schema.js";
+import { planDueDates } from "./plan-dates.js";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
 const publicDir = join(root, "public");
@@ -207,6 +208,11 @@ function cleanUrl(value) {
     return null;
   }
 }
+
+// Trash: admins, and program managers on the program, can move a program to the
+// trash and restore it. Only admins can delete it for good.
+const canTrashProject = (user, project) => canManage(user)
+  || (user.role === "program_manager" && [project.project_manager_id, ...project.team_ids].includes(user.id));
 
 // ------------------------------------------------------------------ responses
 
@@ -435,6 +441,11 @@ async function handleApi(request, response, url) {
       projects: projects.map((project) => projectResponse(model, project)), tasks, notifications,
       templates: model.templates.map((template) => templateResponse(model, template)),
       integration: integrationStatus(),
+      trash: model.trashedProjects.filter((project) => canTrashProject(user, project)).map((project) => ({
+        id: project.id, name: project.name, startDate: project.start_date, taskCount: project.task_count,
+        deletedAt: project.deleted_at, deletedBy: model.usersById.get(project.deleted_by)?.name || "Unknown",
+        canDeleteForever: canManage(user)
+      })),
       sites: model.sites.map((site) => ({ id: site.id, label: site.label, name: site.name, location: site.location, city: site.city, state: site.state, region: site.region })),
       regions: model.regions.map((region) => ({ id: region.id, name: region.name })),
       visibleProjectCount: projects.length
@@ -518,6 +529,10 @@ async function handleApi(request, response, url) {
     if (!validateDate(input.startDate) || !validateDate(endDate) || endDate < input.startDate) return send(response, 400, { error: "Enter valid program dates; the end date must be on or after the start date." });
     const manager = activeUser(model, input.projectManagerId);
     if (!manager || manager.role === "external_partner") return send(response, 400, { error: "Choose an internal employee as the project manager." });
+    // Extra team members (besides the manager), chosen in the form.
+    const teamIds = [...new Set((Array.isArray(input.teamIds) ? input.teamIds : []).map(String))].filter((id) => id !== manager.id);
+    if (teamIds.length > 50 || teamIds.some((id) => !activeUser(model, id))) return send(response, 400, { error: "Choose active teammates for the program team." });
+    if (user.id !== manager.id && !teamIds.includes(user.id)) teamIds.push(user.id);
     const creationMode = input.creationMode === "scratch" ? "scratch" : "template";
     const template = creationMode === "template" && input.templateId ? model.templates.find((item) => item.id === input.templateId) : null;
     if (creationMode === "template" && !template) return send(response, 400, { error: "Choose a valid task template, or select Create from scratch." });
@@ -542,15 +557,17 @@ async function handleApi(request, response, url) {
     const projectId = await store.createProject({
       name, description: String(input.description || ""), programType: input.programType, siteId, programHours,
       startDate: input.startDate, endDate, status: "Planning", managerId: manager.id,
-      teamIds: user.id === manager.id ? [] : [user.id], templateId: template?.id || null, details
+      teamIds, templateId: template?.id || null, details
     });
     const steps = template ? model.templateTasks.filter((step) => step.template_id === template.id) : [];
+    // Prep steps that would already be in the past are fitted between today and the start.
+    const plan = planDueDates(input.startDate, steps.map((step) => step.relative_due_days));
     let taskIds = [];
     try {
       const owners = steps.map((step) => resolveStepOwner(model, step, manager.id));
       taskIds = await store.createTasks(steps.map((step, index) => ({
         projectId, stepId: step.id, title: step.title, description: step.description, ownerIds: [owners[index]],
-        status: "Not Started", priority: step.priority, plannedDue: addDays(input.startDate, step.relative_due_days), milestone: step.milestone
+        status: "Not Started", priority: step.priority, plannedDue: plan.dates[index], milestone: step.milestone
       })));
       const links = steps.map((step, index) => ({ id: taskIds[index], prerequisiteIds: step.dependency_index ? [taskIds[step.dependency_index - 1]].filter(Boolean) : [] }))
         .filter((item) => item.prerequisiteIds.length);
@@ -562,14 +579,16 @@ async function handleApi(request, response, url) {
         userId, projectId,
         message: titles.length === 1 ? `New task assigned: ${titles[0]} — ${name}` : `${titles.length} new tasks assigned in ${name}`
       })));
-      await logActivity(projectId, null, user.id, "Project created", template ? `${name} created from ${template.name}.` : `${name} created from scratch.`);
+      await logActivity(projectId, null, user.id, "Project created", (template ? `${name} created from ${template.name}.` : `${name} created from scratch.`)
+        + (plan.compressed ? ` The template expects ${plan.neededDays} days of lead time but the program starts in ${plan.leadDays}, so earlier steps were fitted between today and the start date.` : ""));
+      if (steps.length && taskIds.length !== steps.length) throw new Error(`Only ${taskIds.length} of ${steps.length} template tasks were created in Airtable.`);
     } catch (error) {
       // Best effort: leave no half-built program behind.
       await store.deleteRecords("Work", taskIds).catch(() => {});
       await store.deleteRecords("Session", [projectId]).catch(() => {});
       throw error;
     }
-    return send(response, 201, { projectId, taskCount: taskIds.length });
+    return send(response, 201, { projectId, taskCount: taskIds.length, compressed: plan.compressed, leadDays: plan.leadDays, neededDays: plan.neededDays });
   }
   if (request.method === "POST" && path.startsWith("/api/projects/") && path.endsWith("/tasks")) {
     const projectId = pathId(path, "/api/projects/", "/tasks");
@@ -702,6 +721,32 @@ async function handleApi(request, response, url) {
     }
   }
 
+  const trashRoute = path.match(/^\/api\/projects\/([^/]+)\/(trash|restore|delete-forever)$/);
+  if (trashRoute && request.method === "POST") {
+    const projectId = decodeURIComponent(trashRoute[1]);
+    const action = trashRoute[2];
+    const project = action === "trash" ? model.projectsById.get(projectId) : model.trashedById.get(projectId);
+    if (!project || !canTrashProject(user, project)) return send(response, 404, { error: "Program not found, or you can't change it." });
+    if (action === "trash") {
+      await store.updateProject(projectId, { details: { ...project.raw_details, deletedAt: nowISO(), deletedBy: user.id } });
+      await logActivity(projectId, null, user.id, "Program moved to trash", `${project.name} was moved to the trash.`);
+      return send(response, 200, { ok: true });
+    }
+    if (action === "restore") {
+      const { deletedAt, deletedBy, ...details } = project.raw_details;
+      await store.updateProject(projectId, { details });
+      await logActivity(projectId, null, user.id, "Program restored", `${project.name} was restored from the trash.`);
+      return send(response, 200, { ok: true });
+    }
+    if (!canManage(user)) return send(response, 403, { error: "Only administrators can delete a program for good." });
+    // Deletes the program, its tasks and its files/links from Airtable. Not reversible.
+    const workIds = await store.recordIdsLinkedTo(T.work, "session", projectId);
+    const resourceIds = await store.recordIdsLinkedTo(T.resources, "session", projectId);
+    await store.deleteRecords(T.resources, resourceIds);
+    await store.deleteRecords(T.work, workIds);
+    await store.deleteRecords(T.sessions, [projectId]);
+    return send(response, 200, { ok: true, deletedTasks: workIds.length });
+  }
   const resourceRoute = path.match(/^\/api\/projects\/([^/]+)\/resources\/(links|files)$/);
   if (resourceRoute && request.method === "POST") {
     const projectId = decodeURIComponent(resourceRoute[1]);

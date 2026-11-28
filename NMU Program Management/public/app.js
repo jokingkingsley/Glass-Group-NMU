@@ -263,7 +263,8 @@ function showStatList(kind) {
   modalRoot.querySelector(".modal-close")?.focus();
 }
 function renderProjects() {
-  const actions = isManager() ? `<button class="button primary" data-action="create-project">＋ Create program</button>` : "";
+  const trashCount = (state.data.trash || []).length;
+  const actions = isManager() ? `${trashCount?`<button class="button ghost" data-action="open-trash">🗑 Trash (${trashCount})</button>`:""}<button class="button primary" data-action="create-project">＋ Create program</button>` : "";
   return `${pageHeading("PROGRAMS", "All programs", "Search programs, review deadlines, and open a workspace to coordinate the team.", actions)}
     <section class="panel"><div class="panel-head"><div><h2 class="panel-title">Program portfolio</h2><p class="panel-subtitle">${state.data.projects.length} organization-wide programs · ${filteredProjects().length} shown</p></div><div class="panel-actions"><input class="search-input" data-filter="project-search" placeholder="Search programs…" value="${escapeHtml(state.projectSearch)}" aria-label="Search programs"><select class="filter-select" data-filter="project-status" aria-label="Filter by program status"><option value="all">All statuses</option>${["On Track","At Risk","Planning","Completed"].map((item) => `<option value="${item}" ${state.projectStatus===item?"selected":""}>${item}</option>`).join("")}</select>${exportMenu()}</div></div>${projectFiltersMarkup()}${projectTable(filteredProjects())}</section>`;
 }
@@ -572,7 +573,7 @@ function renderProject(data) {
   const { project, tasks, members, activities, comments } = data;
   const allowedTasks = userRole() === "external_partner" ? tasks.filter(isMine) : tasks;
   const canReplan = isAdmin() || (userRole()==="program_manager" && (project.projectManagerId===state.userId || members.some((member)=>member.id===state.userId)));
-  const pageActions = canReplan ? `<button class="button primary" data-action="create-task">＋ Add task</button><button class="button ghost" data-action="replan">◷ Adjust dates</button>` : "";
+  const pageActions = canReplan ? `<button class="button primary" data-action="create-task">＋ Add task</button><button class="button ghost" data-action="replan">◷ Adjust dates</button><button class="button ghost danger" data-action="trash-program">Move to trash</button>` : "";
   let pane = "";
   if (state.projectTab === "overview") {
     const next = allowedTasks.filter((task)=>task.status!=="Completed").sort((a,b)=>a.dueDate.localeCompare(b.dueDate)).slice(0,4);
@@ -706,87 +707,139 @@ function formField(label, name, type="text", options={}) {
   if (type === "textarea") return `<div class="form-field${full}"><label for="${name}">${escapeHtml(label)}${options.required?" *":""}</label><textarea id="${name}" name="${name}" ${required} ${placeholder}>${escapeHtml(options.value||"")}</textarea></div>`;
   return `<div class="form-field${full}"><label for="${name}">${escapeHtml(label)}${options.required?" *":""}</label><input id="${name}" name="${name}" type="${type}" ${required} ${value} ${placeholder} ${step}></div>`;
 }
+const roleLabels = { admin: "Admin", program_manager: "Program manager", employee: "Employee", external_partner: "Partner" };
+const PROGRAM_TYPES = ["Learn to Swim", "Swim Safely Series"];
+// Same rule as the server (plan-dates.js): prep steps that would already be in the
+// past are fitted between today and the start date instead of showing as overdue.
+function planDueDates(startDate, offsets, today = new Date().toISOString().slice(0, 10)) {
+  const between = (a, b) => Math.round((Date.parse(`${b}T12:00:00Z`) - Date.parse(`${a}T12:00:00Z`)) / 86400000);
+  const plus = (date, days) => new Date(Date.parse(`${date}T12:00:00Z`) + days * 86400000).toISOString().slice(0, 10);
+  const neededDays = -Math.min(0, ...offsets);
+  const leadDays = Math.max(0, between(today, startDate));
+  if (neededDays <= leadDays) return { dates: offsets.map((offset) => plus(startDate, offset)), compressed: false, leadDays, neededDays };
+  const scale = neededDays ? leadDays / neededDays : 1;
+  return { compressed: true, leadDays, neededDays, dates: offsets.map((offset) => {
+    if (offset >= 0) return plus(startDate, offset);
+    const date = plus(startDate, Math.round(offset * scale));
+    return date < today ? today : date;
+  }) };
+}
+// Templates offered for a program type: those made for it, plus general ones.
+function templatesForType(programType) {
+  const all = state.data.templates;
+  const fits = all.filter((template) => template.programType === programType || !PROGRAM_TYPES.includes(template.programType));
+  return fits.length ? fits : all;
+}
 function showProjectForm() {
   if (!isManager()) return;
-  const templates = state.data.templates;
-  const employees = state.data.users.filter((item)=>item.role!=="external_partner");
+  const people = state.data.users.filter((item)=>item.role!=="external_partner");
+  const everyone = state.data.users;
   const start = new Date(); start.setDate(start.getDate()+60);
   const startValue = start.toISOString().slice(0,10);
   const deliveryTypes = [["Community","Community"],["School","School"],["One-Time Clinic","One-time clinic"]];
-  const matchingTemplate = (deliveryType) => templates.find((item)=>
-    item.programType.toLowerCase() === (deliveryType==="One-Time Clinic"?"Clinic":deliveryType).toLowerCase()
-  ) || templates[0];
-  const templateOptions = templates.map((item)=>[item.id,`${item.name} · ${item.programType}`]);
-  // Programs happen at a Site in Airtable (host + location, grouped by Region).
   const sites = state.data.sites || [];
   const regions = state.data.regions || [];
-  modalRoot.innerHTML = `<div class="modal-backdrop" data-close-modal><section class="modal wide" role="dialog" aria-modal="true" aria-labelledby="project-modal-title"><header class="modal-head"><div><h2 id="project-modal-title">Create a program</h2><p>Choose a template, review the generated task plan, and create the project.</p></div><button class="modal-close" data-action="close-modal" aria-label="Close dialog">×</button></header><form id="project-form"><div class="modal-body"><div class="form-grid">
-    ${formField("Program type","programType","select",{required:true,choices:[["Learn to Swim","Learn to Swim"],["Swim Safely Series","Swim Safely Series"]]})}
-    ${formField("Delivery type","deliveryType","select",{required:true,choices:deliveryTypes,value:"Community"})}
-    ${formField("Site","siteId","select",{full:true,choices:[...sites.map((site)=>[site.id,[site.name||site.label,site.location].filter(Boolean).join(" · ")]),["","＋ New site…"]],value:sites[0]?.id||""})}
-    <div id="new-site-fields" class="form-grid full" style="grid-column:1/-1">
-    ${formField("Host organization","hostOrganization","text",{placeholder:"e.g. Bellevue YMCA"})}
-    ${formField("City","city","text",{placeholder:"e.g. Bellevue"})}
-    ${formField("State","state","text",{placeholder:"e.g. WA"})}
-    ${regions.length?formField("Region","regionId","select",{choices:[["","No region"],...regions.map((region)=>[region.id,region.name])]}):""}
-    </div>
-    ${formField("Program name","name","text",{required:true,placeholder:"Generated from type, city, and host"})}
-    ${formField("Program date","startDate","date",{required:true,value:startValue})}
-    ${formField("Program hours","programHours","number",{step:"0.5",placeholder:"e.g. 24"})}
-    ${formField("Lead instructor(s)","leadInstructors","text",{placeholder:"Names, separated by commas"})}
-    ${formField("Project manager","projectManagerId","select",{required:true,choices:employees.map((item)=>[item.id,item.name]),value:state.data.currentUser.id})}
-    ${formField("Create from","creationMode","select",{required:true,choices:[["template","Template · generate a task plan"],["scratch","Scratch · start with no tasks"]],value:"template"})}
-    <div id="template-field">${formField("Task template","templateId","select",{choices:templateOptions,value:matchingTemplate("Community")?.id||""})}</div>
-    <input type="hidden" name="location" id="location">
-    <input type="hidden" name="endDate" id="endDate" value="${startValue}">
-    ${formField("Program description","description","textarea",{full:true,placeholder:"What should the team know about this program?"})}
-    ${formField("Primary contact","primaryContact","text",{placeholder:"Partner contact name"})}
-    ${formField("Contact email","contactEmail","email",{placeholder:"name@example.org"})}
-    ${formField("Expected participants","participants","number",{step:"1",placeholder:"e.g. 40"})}
-    ${formField("Shipping address","shippingAddress","text",{placeholder:"Address for program materials"})}
-    ${formField("Instructor requirements","instructorRequirements","textarea",{placeholder:"Skills, certifications, or coverage"})}
-    ${formField("Volunteer requirements","volunteerRequirements","textarea",{placeholder:"Volunteer roles or estimated count"})}
-    ${formField("Special requirements","specialRequirements","textarea",{placeholder:"Accessibility or operational needs"})}
-    ${formField("Additional notes","notes","textarea",{placeholder:"Context for the team"})}
-  </div><div class="preview-box" id="task-preview"></div></div><footer class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">Cancel</button><button type="submit" class="button primary">Create program and tasks</button></footer></form></section></div>`;
+  const section = (number, title, hint, body) => `<section class="form-section"><header><span class="form-step">${number}</span><div><h3>${title}</h3>${hint?`<p>${hint}</p>`:""}</div></header><div class="form-grid">${body}</div></section>`;
+  modalRoot.innerHTML = `<div class="modal-backdrop" data-close-modal><section class="modal wide" role="dialog" aria-modal="true" aria-labelledby="project-modal-title"><header class="modal-head"><div><h2 id="project-modal-title">Create a program</h2><p>Fill in the basics, pick who's involved, and check the task plan before creating it.</p></div><button class="modal-close" data-action="close-modal" aria-label="Close dialog">×</button></header><form id="project-form"><div class="modal-body">
+    ${section(1, "Program", "", `
+      ${formField("Program type","programType","select",{required:true,choices:PROGRAM_TYPES.map((type)=>[type,type])})}
+      ${formField("Delivery type","deliveryType","select",{required:true,choices:deliveryTypes,value:"Community"})}
+      ${formField("Program start date","startDate","date",{required:true,value:startValue})}
+      ${formField("Program hours","programHours","number",{step:"0.5",placeholder:"e.g. 24"})}
+      ${formField("Program name","name","text",{required:true,full:true,placeholder:"Filled in from the type and site — you can change it"})}`)}
+    ${section(2, "Location", "Choose where the program happens, or add a new site.", `
+      ${formField("Site","siteId","select",{full:true,choices:[...sites.map((site)=>[site.id,[site.name||site.label,site.location].filter(Boolean).join(" · ")]),["","＋ New site…"]],value:sites[0]?.id||""})}
+      <div id="new-site-fields" class="form-grid full" style="grid-column:1/-1">
+      ${formField("Host organization","hostOrganization","text",{placeholder:"e.g. Bellevue YMCA"})}
+      ${formField("City","city","text",{placeholder:"e.g. Bellevue"})}
+      ${formField("State","state","text",{placeholder:"e.g. WA"})}
+      ${regions.length?formField("Region","regionId","select",{choices:[["","No region"],...regions.map((region)=>[region.id,region.name])]}):""}
+      </div>`)}
+    ${section(3, "People", "Template tasks are assigned by role; you can reassign any task later.", `
+      ${formField("Project manager","projectManagerId","select",{required:true,choices:people.map((item)=>[item.id,item.name]),value:state.data.currentUser.id})}
+      ${formField("Lead instructor(s)","leadInstructors","text",{placeholder:"Names, separated by commas"})}
+      <fieldset class="form-field full team-picker"><legend>Team members <span class="team-count" id="team-count">0 selected</span></legend>
+        <input type="search" class="team-search" id="team-search" placeholder="Search people…" aria-label="Search people">
+        <div class="team-options">${everyone.map((person)=>`<label class="team-chip" data-name="${escapeHtml(person.name.toLowerCase())}"><input type="checkbox" name="teamIds" value="${escapeHtml(person.id)}"><span>${escapeHtml(person.name)}</span><small>${escapeHtml(roleLabels[person.role]||person.role)}</small></label>`).join("")}</div>
+      </fieldset>`)}
+    ${section(4, "Task plan", "", `
+      ${formField("Task template","templateId","select",{full:true,choices:[]})}
+      <div class="preview-box full" id="task-preview" style="grid-column:1/-1"></div>`)}
+    <details class="form-section optional"><summary><span class="form-step">5</span><div><h3>Partner &amp; logistics details</h3><p>Optional · can be added later</p></div></summary><div class="form-grid">
+      ${formField("Program description","description","textarea",{full:true,placeholder:"What should the team know about this program?"})}
+      ${formField("Primary contact","primaryContact","text",{placeholder:"Partner contact name"})}
+      ${formField("Contact email","contactEmail","email",{placeholder:"name@example.org"})}
+      ${formField("Expected participants","participants","number",{step:"1",placeholder:"e.g. 40"})}
+      ${formField("Shipping address","shippingAddress","text",{placeholder:"Address for program materials"})}
+      ${formField("Instructor requirements","instructorRequirements","textarea",{placeholder:"Skills, certifications, or coverage"})}
+      ${formField("Volunteer requirements","volunteerRequirements","textarea",{placeholder:"Volunteer roles or estimated count"})}
+      ${formField("Special requirements","specialRequirements","textarea",{placeholder:"Accessibility or operational needs"})}
+      ${formField("Additional notes","notes","textarea",{placeholder:"Context for the team"})}
+    </div></details>
+    <input type="hidden" name="location" id="location"><input type="hidden" name="endDate" id="endDate" value="${startValue}"><input type="hidden" name="creationMode" id="creationMode" value="template">
+  </div><footer class="modal-actions"><span class="modal-summary" id="create-summary"></span><button type="button" class="button ghost" data-action="close-modal">Cancel</button><button type="submit" class="button primary" id="create-submit">Create program</button></footer></form></section></div>`;
   const form = modalRoot.querySelector("#project-form");
   const nameInput = form.elements.namedItem("name");
   const selectedSite = () => sites.find((site)=>site.id===form.elements.siteId.value);
   const generatedName = () => {
-    const type = form.elements.programType.value;
     const site = selectedSite();
     const city = site ? site.city || site.location : form.elements.city.value.trim();
     const host = site ? site.name : form.elements.hostOrganization.value.trim();
-    if (!city) return "";
-    return `${type} – ${city}${host ? ` ${host}` : ""}`;
+    if (!city && !host) return "";
+    return `${form.elements.programType.value} – ${[city, host].filter(Boolean).join(" · ")}`;
   };
-  const updatePreview = () => {
-    const deliveryType = form.elements.deliveryType.value;
-    const preferred = matchingTemplate(deliveryType);
-    if (form.elements.creationMode.value==="template" && preferred && !templates.some((item)=>item.id===form.elements.templateId.value&&item.programType.toLowerCase()===(deliveryType==="One-Time Clinic"?"Clinic":deliveryType).toLowerCase())) {
-      form.elements.templateId.value=preferred.id;
-    }
-    document.getElementById("template-field").hidden = form.elements.creationMode.value !== "template";
-    const templateId = form.elements.templateId.value;
-    const template = templates.find((item)=>item.id===templateId);
-    const sampleTasks = form.elements.creationMode.value==="scratch" ? [] : templateTaskPreview(templateId);
-    const startDate = document.getElementById("startDate").value;
-    if (nameInput.dataset.userEdited!=="true") nameInput.value=generatedName();
+  // The template list follows the chosen program type; the user's pick is kept when it still fits.
+  const fillTemplates = () => {
+    const select = form.elements.templateId;
+    const options = templatesForType(form.elements.programType.value);
+    const previous = select.value;
+    select.innerHTML = options.map((template)=>`<option value="${escapeHtml(template.id)}">${escapeHtml(template.name)} · ${template.tasks.length} ${template.tasks.length===1?"task":"tasks"}</option>`).join("") + `<option value="">No template · start with an empty task list</option>`;
+    const best = options.find((template)=>template.id===previous) || [...options].sort((a,b)=>b.tasks.length-a.tasks.length)[0];
+    select.value = best ? best.id : "";
+  };
+  const update = () => {
+    if (nameInput.dataset.userEdited!=="true") nameInput.value = generatedName();
     const site = selectedSite();
-    const newSite = !site;
-    document.getElementById("new-site-fields").hidden = !newSite;
-    ["hostOrganization","city","state"].forEach((name)=>{ form.elements[name].required = newSite; });
+    document.getElementById("new-site-fields").hidden = Boolean(site);
+    ["hostOrganization","city","state"].forEach((name)=>{ form.elements[name].required = !site; });
     form.elements.location.value = site ? site.location : [form.elements.city.value.trim(),form.elements.state.value.trim()].filter(Boolean).join(", ");
-    form.elements.endDate.value=startDate;
-    document.getElementById("task-preview").innerHTML = form.elements.creationMode.value==="scratch"
-      ? `<h3>Start from scratch</h3><p>No tasks will be generated. You can create tasks from the new program workspace.</p>`
-      : `<h3>Generated task preview · ${sampleTasks.length} tasks · ${escapeHtml(template?.name||"")}</h3>${sampleTasks.map(([title,offset])=>`<div class="preview-task"><span>${escapeHtml(title)}</span><span>${startDate?dateLabel(addDate(startDate,offset),{month:"short",day:"numeric"}):`${offset} days from start`}</span></div>`).join("")}`;
+    const startDate = form.elements.startDate.value;
+    form.elements.endDate.value = startDate;
+    // Team: the manager is always on the team, so their chip is locked on.
+    const managerId = form.elements.projectManagerId.value;
+    form.querySelectorAll('input[name="teamIds"]').forEach((box)=>{ const isManagerBox = box.value===managerId; box.disabled = isManagerBox; if (isManagerBox) box.checked = true; box.closest(".team-chip").classList.toggle("locked", isManagerBox); });
+    const teamCount = form.querySelectorAll('input[name="teamIds"]:checked').length;
+    document.getElementById("team-count").textContent = `${teamCount} selected`;
+    const template = state.data.templates.find((item)=>item.id===form.elements.templateId.value);
+    form.elements.creationMode.value = template ? "template" : "scratch";
+    const preview = document.getElementById("task-preview");
+    if (!template) {
+      preview.innerHTML = `<h3>Empty task list</h3><p>No tasks will be generated. Add tasks from the program page after creating it.</p>`;
+    } else if (!template.tasks.length) {
+      preview.innerHTML = `<h3>${escapeHtml(template.name)} has no steps yet</h3><p>Add its steps in Airtable (Steps table, linked to this template), or pick another template.</p>`;
+    } else {
+      const plan = planDueDates(startDate, template.tasks.map((task)=>task.relativeDueDays));
+      const rows = template.tasks.map((task, index)=>({ title: task.title, date: plan.dates[index] })).sort((a,b)=>a.date.localeCompare(b.date));
+      const first = rows[0].date, last = rows.at(-1).date;
+      preview.innerHTML = `<h3>${template.tasks.length} tasks · ${dateLabel(first,{month:"short",day:"numeric",year:"numeric"})} – ${dateLabel(last,{month:"short",day:"numeric",year:"numeric"})}</h3>
+        ${plan.compressed?`<p class="plan-note">This template plans ${plan.neededDays} days of preparation, but the program starts in ${plan.leadDays} days. Earlier steps are fitted between today and the start date, so nothing starts out overdue.</p>`:""}
+        ${rows.slice(0,8).map((row)=>`<div class="preview-task"><span>${escapeHtml(row.title)}</span><span>${dateLabel(row.date,{month:"short",day:"numeric"})}</span></div>`).join("")}
+        ${rows.length>8?`<p class="preview-more">…and ${rows.length-8} more tasks</p>`:""}`;
+    }
+    const taskCount = template ? template.tasks.length : 0;
+    document.getElementById("create-submit").textContent = taskCount ? `Create program and ${taskCount} tasks` : "Create program";
+    document.getElementById("create-summary").textContent = `${teamCount} ${teamCount===1?"person":"people"} on the team`;
   };
   nameInput.addEventListener("input",()=>{nameInput.dataset.userEdited="true";});
-  form.addEventListener("input",(event)=>{if(["city","hostOrganization","programType","siteId"].includes(event.target.name)&&nameInput.dataset.userEdited!=="true")nameInput.value=generatedName();});
-  form.addEventListener("input",updatePreview);
-  form.addEventListener("change",updatePreview);
-  updatePreview();
+  form.elements.programType.addEventListener("change", fillTemplates);
+  document.getElementById("team-search").addEventListener("input",(event)=>{
+    const query = event.target.value.trim().toLowerCase();
+    form.querySelectorAll(".team-chip").forEach((chip)=>{ chip.hidden = Boolean(query) && !chip.dataset.name.includes(query); });
+  });
+  form.addEventListener("input",update);
+  form.addEventListener("change",update);
+  fillTemplates();
+  update();
 }
 function addDate(date, offset) {
   const result = new Date(`${date}T12:00:00`);
@@ -954,7 +1007,7 @@ document.addEventListener("click",async(event)=>{
     } catch (error) { showToast(error.message, true); }
     return;
   }
-  const action = event.target.closest("[data-action]");
+  const action = event.target.closest("[data-action], [data-trash-action]");
   if (action) {
     if (action.dataset.action==="logout") {
       try { await api("/api/auth/logout",{method:"POST",body:"{}"}); state.data=null; renderLogin("You have signed out."); }
@@ -963,6 +1016,9 @@ document.addEventListener("click",async(event)=>{
     else if (action.dataset.action==="create-project") showProjectForm();
     else if (action.dataset.action==="create-task") showTaskForm();
     else if (action.dataset.action==="replan") showReplan();
+    else if (action.dataset.action==="trash-program") confirmTrash();
+    else if (action.dataset.action==="open-trash") showTrash();
+    else if (action.dataset.trashAction) await trashAction(action.dataset.trashAction, action.dataset.projectId, action);
     else if (action.dataset.action==="clear-project-filters") {
       state.projectSearch="";
       state.projectStatus="all";
@@ -1057,16 +1113,19 @@ document.addEventListener("submit",async(event)=>{
     event.preventDefault();
     const formData=new FormData(event.target);
     const input=Object.fromEntries(formData.entries());
+    input.teamIds=formData.getAll("teamIds");
     const submit=event.target.querySelector('[type="submit"]');
     submit.disabled=true;
+    const label=submit.textContent;
+    submit.textContent="Creating in Airtable…";
     try {
       const result=await api("/api/projects",{method:"POST",body:JSON.stringify(input)});
       modalRoot.innerHTML="";
       state.page="projects";
       await refresh();
       await openProject(result.projectId);
-      showToast(`Program created with ${result.taskCount} generated tasks.`);
-    } catch(error) { showToast(error.message,true); submit.disabled=false; }
+      showToast(result.taskCount ? `Program created with ${result.taskCount} tasks${result.compressed?" (prep steps fitted before the start date)":""}.` : "Program created. Add tasks from the program page.");
+    } catch(error) { showToast(error.message,true); submit.disabled=false; submit.textContent=label; }
   }
   if(event.target.id==="create-task-form") {
     event.preventDefault();
@@ -1403,3 +1462,37 @@ function exportCsv(kind) {
   });
   document.addEventListener("click", (event) => { if (sidebar.classList.contains("open") && !sidebar.contains(event.target)) setOpen(false); });
 })();
+
+// ---------------------------------------------------------------- program trash
+// "Move to trash" hides a program (and its tasks) everywhere but keeps it in Airtable,
+// so it can be restored. Admins can delete a trashed program for good.
+function confirmTrash() {
+  const project = state.projectData?.project;
+  if (!project) return;
+  modalRoot.innerHTML = `<div class="modal-backdrop" data-close-modal><section class="modal" role="dialog" aria-modal="true" aria-labelledby="trash-title"><header class="modal-head"><div><h2 id="trash-title">Move this program to the trash?</h2><p>${escapeHtml(project.name)} and its ${project.taskCount} tasks will be hidden from everyone. You can restore it from Programs → Trash.</p></div><button class="modal-close" data-action="close-modal" aria-label="Close dialog">×</button></header><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">Cancel</button><button type="button" class="button primary danger" data-trash-action="trash" data-project-id="${escapeHtml(project.id)}">Move to trash</button></div></section></div>`;
+}
+function showTrash() {
+  const items = state.data.trash || [];
+  modalRoot.innerHTML = `<div class="modal-backdrop" data-close-modal><section class="modal wide" role="dialog" aria-modal="true" aria-labelledby="trash-list-title"><header class="modal-head"><div><h2 id="trash-list-title">Trash</h2><p>Programs here are hidden from everyone. Restore one to bring it back with all its tasks.</p></div><button class="modal-close" data-action="close-modal" aria-label="Close dialog">×</button></header><div class="modal-body">${items.length ? `<div class="trash-list">${items.map((item)=>`<div class="trash-row"><div><strong>${escapeHtml(item.name)}</strong><small>${item.taskCount} tasks · starts ${dateLabel(item.startDate,{month:"short",day:"numeric",year:"numeric"})} · moved to trash by ${escapeHtml(item.deletedBy)} ${dateLabel(item.deletedAt,{month:"short",day:"numeric"})}</small></div><div class="trash-actions"><button type="button" class="button small ghost" data-trash-action="restore" data-project-id="${escapeHtml(item.id)}">Restore</button>${item.canDeleteForever?`<button type="button" class="button small ghost danger" data-trash-action="delete-forever" data-project-id="${escapeHtml(item.id)}">Delete forever</button>`:""}</div></div>`).join("")}</div>` : `<div class="empty-state"><strong>The trash is empty</strong></div>`}</div><footer class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">Close</button></footer></section></div>`;
+}
+async function trashAction(kind, projectId, button) {
+  const item = (state.data.trash || []).find((entry)=>entry.id===projectId);
+  if (kind === "delete-forever" && !confirm(`Delete "${item?.name || "this program"}" for good? Its ${item?.taskCount ?? ""} tasks and files are removed from Airtable. This can't be undone.`)) return;
+  button.disabled = true;
+  try {
+    await api(`/api/projects/${encodeURIComponent(projectId)}/${kind}`, { method: "POST", body: "{}" });
+    if (kind === "trash") {
+      modalRoot.innerHTML = "";
+      state.page = "projects";
+      state.projectId = null;
+      state.projectData = null;
+      await refresh();
+      showToast("Program moved to the trash. Restore it from Programs → Trash.");
+      return;
+    }
+    await refresh();
+    if (kind === "restore") { showToast("Program restored."); }
+    else { showToast("Program deleted for good."); }
+    if ((state.data.trash || []).length) showTrash(); else modalRoot.innerHTML = "";
+  } catch (error) { showToast(error.message, true); button.disabled = false; }
+}
